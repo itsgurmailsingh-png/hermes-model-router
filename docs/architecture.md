@@ -1,29 +1,12 @@
-# Architecture — hermes-model-router
+# Architecture — hermes-model-router v1.1
 
 ## Overview
 
-The model router is a two-layer system that classifies each LLM call before it reaches the API. Layer 0 applies deterministic rules in microseconds. Layer 1 scores features when the rules don't produce a clear result. The output is a tier (0–3) which maps to a concrete model name via a configurable table.
+The model router is a two-layer system that classifies each LLM call before it reaches the API. Layer 1 scores features from the message and context. The context tree adds a semantic floor from files you've been touching. The output is a score (0–100) which maps to a tier (0–3) which maps to a concrete model name via a configurable table.
 
 The same scoring logic runs in both Hermes (Python) and Claude Code (Node.js/MJS), with identical tier boundaries, so routing decisions are predictable regardless of which runtime you are in.
 
----
-
-## Layer 0 — Rule Triage
-
-Fast path. If a call matches one of these patterns it is immediately assigned a tier and skips Layer 1.
-
-**Tier 0 (cheapest) — forced cheap:**
-- Call type is `TITLE` or `GREETING`
-- Prompt is a single short phrase with no code and no question mark chain
-- `api_call_count` is very high (internal tool loop iteration, not a user turn)
-
-**Tier 3 (most capable) — forced expensive:**
-- Prompt contains `/analyze`, `/architect`, or `/plan` slash commands
-- Prompt has three or more fenced code blocks
-- Prompt references four or more file paths
-- Call type is `ORCHESTRATE`
-
-If neither forced path matches, control passes to Layer 1.
+**v1.1 changes**: ALL calls are now routed (main chat included, not just internal calls). The context tree is wired into the router — it's no longer "planned v2", it's live.
 
 ---
 
@@ -63,14 +46,18 @@ Any fenced code block (`` ``` ``) in the prompt adds 15 points. The rationale: i
 
 If the prompt references two or more distinct file paths (heuristic: strings containing `/` or ending in a known extension), +15 is added. Multi-file tasks require cross-file reasoning which cheaper models handle poorly.
 
-### Tier boundaries
+### Low-signal override
 
-| Score | Tier |
-|-------|------|
-| 0–24 | 0 |
-| 25–49 | 1 |
-| 50–74 | 2 |
-| 75–100 | 3 |
+If the message matches a greeting/acknowledgement pattern (`hi`, `thanks`, `ok`, `done`, etc.) it scores 5, regardless of other features. This ensures trivial messages route to the cheapest tier — unless the context tree floor overrides it.
+
+### Tier boundaries (actual code)
+
+| Score | Tier | Ollama model | Claude model |
+|-------|------|-------------|-------------|
+| 0–20 | 0 | ministral-3:3b | claude-haiku-4-5-20251001 |
+| 21–45 | 1 | gemma3:12b | claude-haiku-4-5-20251001 |
+| 46–70 | 2 | devstral-small-2:24b | claude-sonnet-4-6 |
+| 71–100 | 3 | glm-5.2 | claude-opus-4-6 |
 
 ---
 
@@ -79,13 +66,56 @@ If the prompt references two or more distinct file paths (heuristic: strings con
 The session floor prevents mid-session regression: once a complex task has been seen, simpler follow-up turns do not fall back to cheap models that have no context.
 
 - Floor starts at 0.
-- After each call, the floor is updated: `floor = max(floor, tier - 1)`.
-- Floor decays by 1 tier for every 3 consecutive simple calls (score < 30).
-- Floor is stored in memory per session, not persisted across restarts.
+- After each call, the floor is updated: `floor = max(floor, turn_score)`.
+- Floor decays by 5 per simple turn (score < current floor).
+- Floor is stored in memory per session (`RouterSession`), not persisted across restarts.
 
 This means:
-- A coding session that hits Tier 2 will not route the next turn below Tier 1.
+- A coding session that hit score 68 will not route the next turn below 63.
 - A long chain of simple turns (acknowledgements, confirmations) eventually lets the floor decay back to 0.
+
+---
+
+## Context Tree Floor (v1.1 — LIVE)
+
+The context tree maintains a live semantic graph of the agent's working context. It tracks:
+
+- **FILE nodes** — every file read or written, with auto-extracted domain tags (auth, security, database, api, test, config, ui, infra) and a complexity score (0–100) based on lines, functions, classes, imports, and branching.
+- **TURN nodes** — each user message, tagged by domain.
+- **CALL nodes** — tool calls (bash, delegate_task, search_files, patch, terminal).
+
+### How the floor is computed
+
+`context_tree.query.complexity_floor(graph, prompt)`:
+
+1. Extract domain tags from the prompt (e.g. "fix the auth token" → {auth}).
+2. Score all graph nodes by tag overlap (×20) + node type weight (FILE=10, SYMBOL=8, TURN=6) + recency bonus (×15 if in last 10 touched) + complexity (×0.1).
+3. Take the top-4 scored nodes with score > 0.
+4. Floor = average of the top node's complexity and the mean complexity of the 4 nodes, capped at 70.
+
+This floor is merged with the session floor (`max(session_floor, ctx_floor)`) before applying the call-type offset.
+
+### What this prevents
+
+Without the context tree, a short follow-up like "fix the typo" after a complex auth refactor scores 30 → routes to `gemma3:12b` (Tier 1). That model has no idea what you've been doing. With the context tree, the floor from `auth.py` (complexity 72) pushes the effective score to 70 → routes to `devstral-small-2:24b` (Tier 2). The model can't see your code, but the router knows you're in a complex session.
+
+### Graph persistence
+
+The graph is saved to `~/.hermes/router-logs/context-graph.json` after every turn. It's loaded on session start if it exists. The Claude Code `agent-router.mjs` hook reads this same file for cross-runtime floor sharing.
+
+### Node data structure (actual implementation)
+
+```python
+@dataclass
+class Node:
+    id:         str          # "file:src/auth.py", "turn:sess:1", "call:sess:1:2"
+    type:       str          # FILE, TURN, CALL, SYMBOL, TASK
+    label:      str          # "auth.py", "refactor auth", "bash: pytest"
+    tags:       List[str]    # ["auth", "security"]
+    complexity: int          # 0-100
+    ts:         str          # ISO timestamp
+    meta:       Dict         # {"path": "...", "last_op": "read"}
+```
 
 ---
 
@@ -100,45 +130,40 @@ Call type is determined from context metadata, not from the prompt text. Hermes 
 | CODEGEN / write code | -10 | Discounted — models at Tier 1+ handle this fine |
 | VERIFY / review | -20 | Review is lower stakes than generation |
 | SUMMARIZE / format | -30 | Mechanical task, Tier 0/1 is fine |
-| TITLE generation | -40 | Always cheap; scores floor at Tier 0 |
+| TITLE generation | -99 | Always cheapest; scores floor at Tier 0 regardless of context |
+| SUBAGENT | -10 | Children run one tier below parent |
 
-Offsets are applied after the session floor check, so the floor still protects against regressions.
+Offsets are applied after both the session floor and context tree floor checks, so both floors still protect against regressions. TITLE (-99) overrides everything — title generation always routes to Tier 0.
 
 ---
 
-## Planned v2 — Context Tree
+## What Gets Routed
 
-The current scorer treats each call independently (except for the session floor). v2 will maintain a lightweight context tree per session.
+### Hermes (full control via `pre_llm_call` hook)
 
-### Goals
+ALL calls are routed in v1.1:
 
-1. **Dependency-aware routing**: if Call B is downstream of a complex Call A, B inherits A's tier as its floor, even if B's text looks simple.
-2. **Conversation graph**: tool calls and sub-agent spawns form a DAG. The router will traverse ancestors to compute an inherited complexity score.
-3. **Cost attribution**: each node in the tree tracks estimated tokens and cost. The UI (or CLI report) can show cost-per-subtask.
-4. **Adaptive keyword weights**: after each session, actual model performance (did the routed model produce a correct result?) is used to update keyword weights via a simple online learning rule.
+| Call source | Routed? | Call type | Notes |
+|-------------|---------|-----------|-------|
+| Main user turn | ✅ | plan | Full score, no offset |
+| Tool loop iteration | ✅ | analyze | -10 offset |
+| Title generation | ✅ | title | -99 → always Tier 0 |
+| Memory review | ✅ | summarize | -30 offset |
+| Sub-agent spawn | ✅ | subagent | -10 offset |
+| Background review | ✅ | verify | -20 offset |
+| Context compression | ✅ | summarize | -30 offset |
+| Session search | ✅ | analyze | -10 offset |
 
-### Prototype data structure
+To skip specific turn types: `export HERMES_ROUTER_SKIP_TYPES=title,memory`
 
-```python
-@dataclass
-class CallNode:
-    call_id: str
-    parent_id: str | None
-    tier: int
-    score: int
-    call_type: str
-    prompt_hash: str          # for dedup
-    tokens_in: int
-    tokens_out: int
-    model: str
-    success: bool | None      # filled in post-call
-```
+### Claude Code (partial control via `PreToolUse` hook)
 
-The tree is stored in memory during the session and optionally serialized to `~/.hermes/router-sessions/<session-id>.json` for offline analysis.
+| Call source | Routed? | Notes |
+|-------------|---------|-------|
+| Sub-agent spawn (Agent tool) | ✅ | Hook rewrites `model` field before execution |
+| Main chat model | ❌ | Set by Claude Code internally before any hook runs |
 
-### Why not now?
-
-The context tree requires a reliable call-ID scheme across Hermes internals, which is not yet stable. The current floor mechanism covers 80% of the benefit at 5% of the complexity.
+Claude Code's main chat model is NOT controllable via hooks. The hook fires on tool calls (Agent spawns), not on the main conversation loop. A reverse proxy would be needed to intercept main chat API calls at the network layer.
 
 ---
 
@@ -160,22 +185,85 @@ Adding a new provider requires:
 
 ## Logging Format
 
-Claude Code logs every routing decision to `~/.claude/router-logs/routing.jsonl`. Each line is a JSON object:
+### Hermes
+
+Logs every routing decision to `~/.hermes/router-logs/routing.jsonl`:
 
 ```json
 {
-  "ts": "2026-06-27T10:15:32.001Z",
-  "prompt_preview": "refactor the auth module to use...",
-  "score": 68,
-  "tier": 2,
-  "model_before": "claude-opus-4-6",
-  "model_after": "claude-sonnet-4-6",
-  "rerouted": true,
-  "call_type": "CODEGEN",
-  "session_floor": 1
+  "ts": "2026-06-28T10:15:32.001Z",
+  "source": "hermes",
+  "session_id": "abc123",
+  "turn_type": "user",
+  "api_call": 1,
+  "call_type": "plan",
+  "model_was": "glm-5.2",
+  "model_used": "devstral-small-2:24b",
+  "routed": true,
+  "prompt": "fix the typo in auth.py..."
 }
 ```
 
-`router-analyze.mjs` reads this file and produces the summary report shown in the README.
+### Claude Code
 
-Hermes logs to the standard Hermes plugin log at `DEBUG` level. No separate log file is created.
+Logs to `~/.claude/router-logs/routing.jsonl`:
+
+```json
+{
+  "ts": "2026-06-28T10:15:32.001Z",
+  "prompt": "refactor the auth module to use...",
+  "subtype": "coder",
+  "call_type": "codegen",
+  "raw_score": 68,
+  "offset": -10,
+  "ctx_floor": 55,
+  "final_score": 58,
+  "model_was": "opus",
+  "model_used": "sonnet",
+  "routed": true
+}
+```
+
+`router-analyze.mjs` reads this file and produces a summary report.
+
+### Context graph
+
+Saved to `~/.hermes/router-logs/context-graph.json` after every turn:
+
+```json
+{
+  "session": "abc123",
+  "nodes": [
+    {"id": "file:src/auth.py", "type": "FILE", "label": "auth.py", "tags": ["auth","security"], "complexity": 72, ...},
+    {"id": "turn:abc123:1", "type": "TURN", "label": "refactor auth", "tags": ["auth"], ...}
+  ],
+  "edges": [
+    {"src": "turn:abc123:1", "dst": "file:src/auth.py", "type": "REFERENCED"}
+  ],
+  "recent": ["file:src/auth.py", "turn:abc123:1"]
+}
+```
+
+---
+
+## Plugin Hooks (v1.1)
+
+| Hook | When | What it does |
+|------|------|-------------|
+| `on_session_start` | Session begins | Creates ContextGraph + ContextTreeBuilder, attaches to agent |
+| `pre_llm_call` | Before every LLM call | Scores message, applies session + context tree floor, routes to tier, returns `{"model": name}` |
+| `post_llm_call` | After each main turn | Updates session complexity floor from message score |
+| `on_tool_result` | After every tool call | Feeds tool result to ContextTreeBuilder (read/write/bash/delegate/search/patch) |
+| `on_turn_start` | User sends message | Adds TURN node to graph, sets as current turn |
+| `on_turn_end` | Turn completes | Saves graph to `~/.hermes/router-logs/context-graph.json` |
+
+---
+
+## Future: Cost Attribution & Adaptive Weights
+
+The context tree has the data structure for cost tracking (Node.meta can hold tokens_in/out), but this is not yet wired. Planned:
+
+1. **Cost attribution** — each node tracks estimated tokens and cost. CLI report shows cost-per-file, cost-per-subtask.
+2. **Adaptive keyword weights** — after each session, actual model performance updates keyword weights via a simple online learning rule.
+3. **SYMBOL nodes** — track individual functions/classes, not just files.
+4. **DEPENDS_ON edges** — traverse the DAG for inherited complexity (if Call B depends on Call A's output, B inherits A's floor even if B's text is simple).

@@ -1,11 +1,11 @@
 # hermes-model-router
 
-> Automatic complexity-based model routing for Hermes Agent and Claude Code. Routes LLM calls to the cheapest model tier that can handle the task — saving 60–75% on inference costs without changing your workflow.
+> Complexity-based model routing for Hermes Agent and Claude Code. Routes ALL LLM calls to the cheapest model tier that can handle the task — saving 60–75% on inference costs. A semantic context tree prevents mid-session downgrades.
 
 ## What it does
 
-- **Hermes**: Hooks into `pre_llm_call` — internal calls (title gen, memory review, tool loops, sub-agents) are automatically routed to cheaper models. Your selected chat model is never touched.
-- **Claude Code**: A `PreToolUse` hook intercepts every Agent spawn and rewrites the `model` field based on task complexity before execution. Hard enforcement, not a suggestion.
+- **Hermes**: Hooks into `pre_llm_call` — **ALL** calls (main chat, sub-agents, title gen, memory review, tool loops) are routed to the cheapest capable tier. A context tree tracks files read/written, tool calls, and turn history to compute a semantic complexity floor that prevents mid-session downgrades.
+- **Claude Code**: A `PreToolUse` hook intercepts every Agent spawn and rewrites the `model` field based on task complexity before execution. Reads the Hermes context graph for cross-runtime floor sharing. **Note**: Claude Code's main chat model is NOT controllable via hooks — only sub-agent spawns can be routed. Hermes has no such limitation.
 
 ## Model Tiers
 
@@ -34,30 +34,69 @@ Each call is scored before routing:
 - Code block in prompt: +15
 - Multi-file task: +15
 - Session complexity floor: never routes below the floor mid-session
+- **Context tree floor**: semantic floor from files you've been touching — prevents downgrade even when the message itself is simple
+
+### Tier boundaries (actual code)
+| Score | Tier | Ollama | Claude |
+|-------|------|--------|--------|
+| ≤ 20 | 0 | ministral-3:3b | haiku |
+| 21–45 | 1 | gemma3:12b | haiku |
+| 46–70 | 2 | devstral-small-2:24b | sonnet |
+| 71–100 | 3 | glm-5.2 | opus |
 
 ### Call-type offsets
-| Call type | Offset |
-|-----------|--------|
-| PLAN / orchestrate | +0 |
-| ANALYZE / read files | -10 |
-| CODEGEN / write code | -10 |
-| VERIFY / review | -20 |
-| SUMMARIZE / format | -30 |
-| TITLE generation | -40 |
+| Call type | Offset | Rationale |
+|-----------|--------|-----------|
+| PLAN / orchestrate | 0 | Full score — planning is expensive |
+| ANALYZE / read files | -10 | Reading is cheaper than writing |
+| CODEGEN / write code | -10 | Tier 1+ handles this fine |
+| VERIFY / review | -20 | Lower stakes than generation |
+| SUMMARIZE / format | -30 | Mechanical task |
+| TITLE generation | -99 | Always cheapest tier |
+| SUBAGENT | -10 | Children run one tier below parent |
+
+### Context tree floor
+
+The context tree maintains a live graph of:
+- **FILE nodes** — every file read or written (tags: auth, security, database, api, test, config, ui, infra)
+- **TURN nodes** — each user message
+- **CALL nodes** — tool calls (bash, delegate_task, search_files, patch, terminal)
+
+When routing a new message, the query engine scores all nodes by tag overlap + recency + complexity, returns the top-k relevant nodes, and computes a semantic complexity floor. This floor is merged with the session floor — so if you've been working on `auth.py` (complexity 72) and say "fix the typo", the router keeps you on `devstral-small-2:24b` instead of downgrading to `gemma3:12b`.
+
+| Message | No context tree | With context tree (auth.py touched) |
+|---------|-----------------|--------------------------------------|
+| "hi" | ministral-3:3b | devstral-small-2:24b |
+| "fix the typo" | gemma3:12b | devstral-small-2:24b |
+| TITLE gen | ministral-3:3b | ministral-3:3b (always cheap) |
+
+## Plugin Hooks
+
+| Hook | When | What it does |
+|------|------|-------------|
+| `on_session_start` | Session begins | Creates ContextGraph + ContextTreeBuilder, attaches to agent |
+| `pre_llm_call` | Before every LLM call | Scores message, applies floors, routes to tier |
+| `post_llm_call` | After each main turn | Updates session complexity floor |
+| `on_tool_result` | After every tool call | Feeds tool result to context tree builder |
+| `on_turn_start` | User sends message | Adds TURN node to graph |
+| `on_turn_end` | Turn completes | Saves graph to `~/.hermes/router-logs/context-graph.json` |
 
 ## Installation
 
 ### Hermes
 ```bash
-# 1. Copy files into your hermes-agent directory
+# 1. Copy agent files (router + context tree)
 cp hermes/agent/model_router.py ~/.hermes/hermes-agent/agent/
 cp hermes/agent/model_router_claude.py ~/.hermes/hermes-agent/agent/
+cp -r hermes/agent/context_tree ~/.hermes/hermes-agent/agent/
+
+# 2. Copy plugin
 cp -r hermes/plugins/model-router ~/.hermes/hermes-agent/plugins/
 
-# 2. Enable the plugin
+# 3. Enable the plugin
 hermes plugins enable model-router
 
-# 3. Restart Hermes
+# 4. Restart Hermes
 ```
 
 Override tiers via env:
@@ -90,12 +129,27 @@ cp claude-code/skills/model-router/SKILL.md ~/.claude/skills/model-router/
 }
 ```
 
+The Claude Code hook reads `~/.hermes/router-logs/context-graph.json` (written by the Hermes plugin) for cross-runtime context tree floor sharing.
+
+## Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HERMES_MODEL_ROUTER` | `1` | Kill switch — set to `0` to disable all routing |
+| `HERMES_ROUTER_SKIP_TYPES` | (empty) | Comma-separated turn types to skip (e.g. `title,memory`) |
+| `HERMES_ROUTER_TIER0` | `ministral-3:3b` | Tier 0 model |
+| `HERMES_ROUTER_TIER1` | `gemma3:12b` | Tier 1 model |
+| `HERMES_ROUTER_TIER2` | `devstral-small-2:24b` | Tier 2 model |
+| `HERMES_ROUTER_TIER3` | `glm-5.2` | Tier 3 model |
+| `CLAUDE_MODEL_ROUTER` | `1` | Kill switch for Claude Code hook |
+| `CLAUDE_ROUTER_TIER0–3` | Claude defaults | Claude tier overrides |
+
 ## Analyzing Routing Decisions
 
-Every Agent spawn is logged to `~/.claude/router-logs/routing.jsonl`.
+Both runtimes log to `~/.hermes/router-logs/routing.jsonl` (Hermes) and `~/.claude/router-logs/routing.jsonl` (Claude Code).
 
 ```bash
-# Full report
+# Claude Code report
 node ~/.claude/helpers/router-analyze.mjs
 
 # Last 20 decisions
@@ -105,40 +159,12 @@ node ~/.claude/helpers/router-analyze.mjs --last 20
 node ~/.claude/helpers/router-analyze.mjs --raw
 ```
 
-Sample output:
-```
-═══════════════════════════════════════════
-  Model Router — Analysis Report
-═══════════════════════════════════════════
-
-  Total calls logged : 47
-  Calls re-routed    : 43 (91%)
-  Avg complexity     : 38/100
-  Est. cost saving   : ~78% vs always-opus
-
-  Model distribution:
-    haiku          31  ██████████████████  66%
-    sonnet         13  ████████  28%
-    opus            3  ██  6%
-```
-
-## Kill Switch
-
-```bash
-# Disable routing entirely
-export HERMES_MODEL_ROUTER=0    # Hermes
-export CLAUDE_MODEL_ROUTER=0    # Claude Code
-```
+The Hermes plugin also saves the context graph to `~/.hermes/router-logs/context-graph.json` after every turn — inspect it to see what files/tags/complexity the router sees.
 
 ## Architecture
 
 ```
 User Message
-     │
-     ▼
-Layer 0: Rule triage (~0ms, free)
-  • Obvious cheap: greetings, titles, yes/no
-  • Obvious expensive: /analyze, code blocks, multi-file
      │
      ▼
 Layer 1: Feature scoring (~1ms, free)
@@ -151,14 +177,28 @@ Session floor applied
   • Floor decays 5pts per simple turn
      │
      ▼
+Context tree floor applied
+  • Semantic floor from files touched (auth, db, api...)
+  • Merged with session floor (max wins)
+     │
+     ▼
 Call-type offset applied
   • PLAN gets full score
   • Internal calls discounted
+  • TITLE always cheapest (-99)
      │
      ▼
 Tier → Model
 ```
 
-## Why a Plugin (not a hook in the main loop)?
+## What CAN and CANNOT be routed
 
-The main chat turn model should always be what the user selected in the UI — overriding it would be wrong. The plugin hooks into `pre_llm_call` which fires for ALL calls including internal ones, and has enough context (`turn_type`, `api_call_count`) to distinguish user-facing from internal calls.
+### Hermes (full control)
+- ✅ Main chat turns — routed via `pre_llm_call` hook
+- ✅ Sub-agent spawns — routed via `pre_llm_call` hook
+- ✅ Internal calls (title gen, memory review, tool loops) — routed via `pre_llm_call`
+- ✅ All other turn types
+
+### Claude Code (partial control)
+- ✅ Sub-agent spawns (Agent tool) — routed via `PreToolUse` hook
+- ❌ Main chat model — set by Claude Code internally before any hook runs, not controllable via hooks. Would need a reverse proxy to intercept at the network layer.
