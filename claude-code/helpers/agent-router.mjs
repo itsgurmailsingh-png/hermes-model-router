@@ -9,9 +9,53 @@
  * Claude Code applies the rewritten input instead of the original.
  */
 
-import { appendFileSync, mkdirSync } from 'fs';
+import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+
+// ── Context graph reader (reads Hermes graph if available) ────────────────────
+const GRAPH_FILE = join(homedir(), '.hermes', 'router-logs', 'context-graph.json');
+
+const TAG_KEYWORDS = {
+  auth: 'auth', login: 'auth', token: 'auth', jwt: 'auth',
+  secur: 'security', encrypt: 'security',
+  database: 'database', db: 'database', sql: 'database', schema: 'database',
+  api: 'api', endpoint: 'api', route: 'api',
+  test: 'test', spec: 'test',
+  deploy: 'infra', docker: 'infra',
+};
+
+function promptTags(prompt) {
+  const lower = prompt.toLowerCase();
+  const tags = new Set();
+  for (const [kw, tag] of Object.entries(TAG_KEYWORDS)) {
+    if (lower.includes(kw)) tags.add(tag);
+  }
+  return tags;
+}
+
+function contextFloor(prompt) {
+  try {
+    if (!existsSync(GRAPH_FILE)) return 0;
+    const graph = JSON.parse(readFileSync(GRAPH_FILE, 'utf8'));
+    const nodes = graph.nodes || [];
+    if (!nodes.length) return 0;
+    const recent = new Set((graph.recent || []).slice(-10));
+    const tags = promptTags(prompt);
+    const scored = nodes.map(n => {
+      let s = 0;
+      const nodeTags = new Set(n.tags || []);
+      for (const t of tags) if (nodeTags.has(t)) s += 20;
+      if (recent.has(n.id)) s += 15;
+      s += (n.complexity || 0) * 0.1;
+      return { n, s };
+    }).filter(x => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 4);
+    if (!scored.length) return 0;
+    const top = Math.max(...scored.map(x => x.n.complexity || 0));
+    const avg = scored.reduce((s, x) => s + (x.n.complexity || 0), 0) / scored.length;
+    return Math.min(70, Math.floor((top + avg) / 2));
+  } catch { return 0; }
+}
 
 const LOG_DIR  = join(homedir(), '.claude', 'router-logs');
 const LOG_FILE = join(LOG_DIR, 'routing.jsonl');
@@ -119,11 +163,12 @@ async function main() {
   // unless it's just the default (no model field = also route)
   // We always route — Claude's suggestion gets overridden here.
 
-  const callType = inferCallType(prompt, subtype);
-  const rawScore = scorePrompt(prompt, description);
-  const offset   = CALL_TYPE_OFFSET[callType] ?? 0;
-  const finalScore = Math.max(0, Math.min(100, rawScore + offset));
-  const model    = scoreToModel(finalScore);
+  const callType   = inferCallType(prompt, subtype);
+  const rawScore   = scorePrompt(prompt, description);
+  const offset     = CALL_TYPE_OFFSET[callType] ?? 0;
+  const ctxFloor   = contextFloor(prompt);
+  const finalScore = Math.max(ctxFloor, Math.min(100, rawScore + offset));
+  const model      = scoreToModel(finalScore);
 
   // Log even when no change needed
   if (explicitModel === model) {
@@ -143,21 +188,22 @@ async function main() {
   }
 
   process.stderr.write(
-    `[agent-router] call_type=${callType} score=${rawScore}+${offset}=${finalScore} → ${model}` +
+    `[agent-router] call_type=${callType} score=${rawScore}+${offset} ctx_floor=${ctxFloor} final=${finalScore} → ${model}` +
     (explicitModel ? ` (was: ${explicitModel})` : '') + '\n'
   );
 
   logDecision({
-    ts:         new Date().toISOString(),
-    prompt:     prompt.slice(0, 120),
-    subtype:    subtype,
-    call_type:  callType,
-    raw_score:  rawScore,
+    ts:          new Date().toISOString(),
+    prompt:      prompt.slice(0, 120),
+    subtype,
+    call_type:   callType,
+    raw_score:   rawScore,
     offset,
+    ctx_floor:   ctxFloor,
     final_score: finalScore,
-    model_was:  explicitModel || null,
-    model_used: model,
-    routed:     true,
+    model_was:   explicitModel || null,
+    model_used:  model,
+    routed:      true,
   });
 
   // Output rewritten tool_input

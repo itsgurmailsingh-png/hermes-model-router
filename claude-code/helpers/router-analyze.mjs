@@ -12,16 +12,28 @@ import { readFileSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
-const LOG_FILE = join(homedir(), '.claude', 'router-logs', 'routing.jsonl');
+const LOG_FILES = [
+  join(homedir(), '.claude',  'router-logs', 'routing.jsonl'),  // Claude Code
+  join(homedir(), '.hermes',  'router-logs', 'routing.jsonl'),  // Hermes
+];
 const args = process.argv.slice(2);
 
-if (!existsSync(LOG_FILE)) {
-  console.log('No routing log yet. Spawn some agents first.');
+const allLines = [];
+for (const f of LOG_FILES) {
+  if (existsSync(f)) {
+    allLines.push(...readFileSync(f, 'utf8').trim().split('\n').filter(Boolean));
+  }
+}
+
+if (!allLines.length) {
+  console.log('No routing log yet. Run some sessions first.');
   process.exit(0);
 }
 
-const lines = readFileSync(LOG_FILE, 'utf8').trim().split('\n').filter(Boolean);
-let entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+let entries = allLines
+  .map(l => { try { return JSON.parse(l); } catch { return null; } })
+  .filter(Boolean)
+  .sort((a, b) => a.ts < b.ts ? -1 : 1);
 
 // --last N
 const lastIdx = args.indexOf('--last');
@@ -62,7 +74,10 @@ console.log('\n═════════════════════�
 console.log('  Model Router — Analysis Report');
 console.log('═══════════════════════════════════════════\n');
 
-console.log(`  Total calls logged : ${total}`);
+const fromHermes = entries.filter(e => e.source === 'hermes').length;
+const fromClaude = entries.filter(e => e.source !== 'hermes').length;
+
+console.log(`  Total calls logged : ${total}  (hermes: ${fromHermes}  claude-code: ${fromClaude})`);
 console.log(`  Calls re-routed    : ${routed} (${pct(routed, total)})`);
 console.log(`  Avg complexity     : ${avg(scores)}/100`);
 console.log(`  Est. cost saving   : ~${saving}% vs always-opus\n`);
@@ -92,4 +107,4 @@ for (const e of entries.slice(-5)) {
   console.log(`    ${flag} [${e.ts.slice(11,19)}] score=${e.final_score} → ${e.model_used.padEnd(8)} "${e.prompt.slice(0,50)}"`);
 }
 
-console.log(`\n  Log: ${LOG_FILE}\n`);
+console.log(`\n  Logs: ${LOG_FILES.filter(existsSync).join(', ')}\n`);

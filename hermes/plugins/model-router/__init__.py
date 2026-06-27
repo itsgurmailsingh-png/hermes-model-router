@@ -26,11 +26,28 @@ Config (config.yaml):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+_LOG_DIR  = Path.home() / ".hermes" / "router-logs"
+_LOG_FILE = _LOG_DIR / "routing.jsonl"
+
+
+def _log_decision(entry: dict) -> None:
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with _LOG_FILE.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # never block the hook
 
 # Turn types that are ALWAYS internal — never the main user chat turn
 _INTERNAL_TURN_TYPES = frozenset({
@@ -126,6 +143,15 @@ def on_pre_llm_call(
     session = _get_session(session_id) if session_id else None
     floor = session.complexity_floor if session else 0
 
+    # Boost floor from context tree if available
+    try:
+        graph = getattr(agent, "_context_graph", None)
+        if graph and len(graph) > 0:
+            from agent.context_tree import complexity_floor as ctx_floor
+            floor = max(floor, ctx_floor(graph, str(user_message or "")))
+    except Exception:
+        pass
+
     # Route
     try:
         from agent.model_router import route_call, CallType, ModelTiers
@@ -158,7 +184,21 @@ def on_pre_llm_call(
                 tiers,
             )
 
-        if routed and routed != model:
+        changed = routed and routed != model
+        _log_decision({
+            "ts":          datetime.now(timezone.utc).isoformat(),
+            "source":      "hermes",
+            "session_id":  session_id,
+            "turn_type":   turn_type,
+            "api_call":    api_call_count,
+            "call_type":   call_type,
+            "model_was":   model or None,
+            "model_used":  routed if changed else model,
+            "routed":      bool(changed),
+            "prompt":      str(user_message or "")[:120],
+        })
+
+        if changed:
             logger.debug(
                 "model-router plugin: turn_type=%s api_call=%d %s → %s",
                 turn_type, api_call_count, model, routed,
