@@ -1,12 +1,17 @@
 name: model-router
-version: 1.0.0
+version: 1.1.0
 description: >
-  Automatically routes internal/auxiliary LLM calls to cheaper model tiers
-  based on task complexity. The user's main chat model is never touched —
-  only side calls (title generation, memory review, background analysis,
-  sub-agents) are routed. Enable with: hermes plugins enable model-router
+  Automatically routes ALL LLM calls to cheaper model tiers based on task
+  complexity + semantic context tree. Main chat, sub-agents, internal calls
+  (title gen, memory review, tool loops) all get routed. The context tree
+  tracks files read/written, tool calls, and turn history to compute a
+  semantic complexity floor that prevents mid-session downgrades.
+  Enable with: hermes plugins enable model-router
 author: local
 hooks:
   - pre_llm_call
   - post_llm_call
   - on_session_start
+  - on_tool_result
+  - on_turn_start
+  - on_turn_end

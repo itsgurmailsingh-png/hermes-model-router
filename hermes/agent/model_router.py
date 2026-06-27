@@ -219,6 +219,11 @@ def route_call(
 
     Attaches/updates a RouterSession on agent._router_session.
     Does NOT mutate agent.model — caller decides whether to swap.
+
+    If agent._context_graph exists (from ContextTreeBuilder), the context
+    tree's semantic complexity floor is merged with the session floor —
+    giving a floor that reflects what files you've been touching, not just
+    the last message score.
     """
     tiers = tiers or _DEFAULT_TIERS
     history = history or []
@@ -235,6 +240,20 @@ def route_call(
     # Apply session complexity floor
     effective_score = max(turn_score, session.complexity_floor)
 
+    # Boost floor from context tree if available
+    ctx_floor_val = 0
+    graph = getattr(agent, "_context_graph", None)
+    if graph is not None and len(graph) > 0:
+        try:
+            try:
+                from agent.context_tree import complexity_floor as _ctx_floor
+            except ImportError:
+                from hermes.agent.context_tree import complexity_floor as _ctx_floor
+            ctx_floor_val = _ctx_floor(graph, message)
+            effective_score = max(effective_score, ctx_floor_val)
+        except Exception:
+            pass
+
     # Apply call-type offset (planning gets full score; summarise always cheap)
     offset = CALL_TYPE_OFFSET.get(call_type, 0)
     final_score = max(0, min(100, effective_score + offset))
@@ -243,10 +262,10 @@ def route_call(
     model = tiers.for_score(final_score)
 
     logger.debug(
-        "model_router: call_type=%s msg_score=%d floor=%d effective=%d "
-        "final=%d → %s",
+        "model_router: call_type=%s msg_score=%d floor=%d ctx_floor=%d "
+        "effective=%d final=%d → %s",
         call_type.value, turn_score, session.complexity_floor,
-        effective_score, final_score, model,
+        ctx_floor_val, effective_score, final_score, model,
     )
 
     return model

@@ -5,11 +5,18 @@ from __future__ import annotations
 import re
 from typing import Any, List
 
-from agent.context_tree.graph import (
-    ContextGraph, Node,
-    FILE, SYMBOL, TURN, CALL,
-    MODIFIED_BY, REFERENCED, TRIGGERED,
-)
+try:
+    from agent.context_tree.graph import (
+        ContextGraph, Node,
+        FILE, SYMBOL, TURN, CALL,
+        MODIFIED_BY, REFERENCED, TRIGGERED,
+    )
+except ImportError:
+    from .graph import (
+        ContextGraph, Node,
+        FILE, SYMBOL, TURN, CALL,
+        MODIFIED_BY, REFERENCED, TRIGGERED,
+    )
 
 # ── Tag extraction ────────────────────────────────────────────────────────────
 
@@ -76,17 +83,19 @@ class ContextTreeBuilder:
     ) -> None:
         try:
             name = (tool_name or "").lower()
-            if name in ("read_file", "view_file", "cat"):
+            if name in ("read_file", "view_file", "cat", "search_files"):
                 self._handle_read(tool_input, tool_output)
-            elif name in ("write_file", "create_file", "edit_file", "str_replace_editor"):
+            elif name in ("write_file", "create_file", "edit_file", "str_replace_editor", "patch"):
                 self._handle_write(tool_input, tool_output)
-            elif name == "bash":
+            elif name in ("bash", "terminal", "shell"):
                 self._handle_bash(tool_input, tool_output)
+            elif name in ("delegate_task", "agent"):
+                self._handle_delegate(tool_input, tool_output)
         except Exception:
             pass  # never break tool execution
 
     def _handle_read(self, inp: dict, out: str) -> None:
-        path = str(inp.get("path") or inp.get("file_path") or inp.get("filename") or "")
+        path = str(inp.get("path") or inp.get("file_path") or inp.get("filename") or inp.get("pattern") or "")
         if not path:
             return
         node = Node(
@@ -103,7 +112,7 @@ class ContextTreeBuilder:
 
     def _handle_write(self, inp: dict, out: str) -> None:
         path = str(inp.get("path") or inp.get("file_path") or inp.get("filename") or "")
-        content = str(inp.get("content") or inp.get("new_str") or inp.get("new_string") or "")
+        content = str(inp.get("content") or inp.get("new_str") or inp.get("new_string") or inp.get("new_text") or "")
         if not path:
             return
         node = Node(
@@ -130,6 +139,22 @@ class ContextTreeBuilder:
             meta={"command": cmd},
         )
         self.graph.add_node(node)
+
+    def _handle_delegate(self, inp: dict, out: str) -> None:
+        """Track sub-agent spawns as CALL nodes."""
+        goal = str(inp.get("goal") or inp.get("prompt") or "")[:80]
+        self._call_idx += 1
+        node = Node(
+            id=_call_node_id(self._turn_idx, self._call_idx, self.session_id),
+            type=CALL,
+            label=f"delegate: {goal[:40]}",
+            tags=_extract_tags(goal),
+            complexity=0,
+            meta={"goal": goal, "type": "delegate"},
+        )
+        self.graph.add_node(node)
+        if self._cur_turn_node_id:
+            self.graph.add_edge(self._cur_turn_node_id, node.id, TRIGGERED)
 
     # ── Turn lifecycle ────────────────────────────────────────────────────────
 

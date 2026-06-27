@@ -71,6 +71,12 @@ function logDecision(entry) {
 
 const HIGH_SIGNALS = /\b(refactor|rewrite|architect|implement|migrate|debug|analy[sz]e|design|optimize|secur|auth|deploy|integrat|build|create|explain why|why does|how does|compare|review|audit|test suite|end.to.end|pipeline|multi.file|codebase|system|database|schema|api|endpoint|algorithm|entire|complex|production|critical)\b/gi;
 
+// Note: main chat model in Claude Code is NOT controllable via hooks.
+// This router only controls Agent tool spawns (sub-agents).
+// The context graph written by the Hermes plugin (~/.hermes/router-logs/
+// context-graph.json) is shared so sub-agent routing benefits from the
+// same semantic floor as the Hermes side.
+
 const LOW_SIGNALS = /^\s*(hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|great|done|got it|sounds good|perfect|nice|cool|search|find|look|read|check|list|show)\s*[!.]?\s*$/i;
 
 const HAS_CODE = /```|\bdef \b|\bclass \b|\bfunction\b|\bimport \b/i;

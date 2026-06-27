@@ -1,16 +1,20 @@
 """model-router — Hermes plugin for automatic call-level model routing.
 
-Routes INTERNAL LLM calls (title gen, memory review, background tasks,
-sub-agents) to cheaper model tiers. The user's selected chat model is
-never changed.
+Routes ALL LLM calls — main chat turns, sub-agents, internal calls
+(title gen, memory review, background tasks, tool loops) — to the cheapest
+model tier that can handle the task. The user's selected model is the
+tier-3 ceiling; simple prompts downgrade to cheaper tiers automatically.
 
-What gets routed vs what doesn't:
-  ✓ api_call_count > 1     → agent is in a tool loop, not the first user turn
-  ✓ turn_type == "tool"    → processing tool results
-  ✓ turn_type == "title"   → generating a session title
-  ✓ turn_type == "memory"  → reviewing memory
-  ✓ turn_type == "background" → background review
-  ✗ api_call_count == 1 AND turn_type == "user"  → main chat turn, leave alone
+What gets routed:
+  ✓ Main user turns (call_type="plan", full score, no offset)
+  ✓ api_call_count > 1 (agent in tool loop)
+  ✓ turn_type == "tool" (processing tool results)
+  ✓ turn_type == "title" (generating session title)
+  ✓ turn_type == "memory" (reviewing memory)
+  ✓ turn_type == "subagent" (spawned child agents)
+  ✓ All other turn types
+
+To skip specific turn types, set HERMES_ROUTER_SKIP_TYPES=title,memory
 
 Enable:   hermes plugins enable model-router
 Disable:  hermes plugins disable model-router
@@ -89,6 +93,9 @@ _TURN_TYPE_TO_CALL_TYPE = {
 
 _sessions: dict[str, Any] = {}
 
+# Context tree state per session: {session_id: (ContextGraph, ContextTreeBuilder)}
+_ctx_builders: dict[str, Any] = {}
+
 
 def _get_session(session_id: str) -> Any:
     from agent.model_router import RouterSession
@@ -97,21 +104,55 @@ def _get_session(session_id: str) -> Any:
     return _sessions[session_id]
 
 
+def _get_ctx_builder(session_id: str) -> Optional[Any]:
+    """Return the ContextTreeBuilder for this session, or None."""
+    entry = _ctx_builders.get(session_id)
+    if entry is None:
+        return None
+    return entry[1]  # (graph, builder) → builder
+
+
+def _get_ctx_graph(session_id: str) -> Optional[Any]:
+    """Return the ContextGraph for this session, or None."""
+    entry = _ctx_builders.get(session_id)
+    if entry is None:
+        return None
+    return entry[0]  # (graph, builder) → graph
+
+
 def _clean_old_sessions(keep: int = 32):
     """Keep memory bounded — drop oldest sessions over the cap."""
     if len(_sessions) > keep:
         oldest = list(_sessions.keys())[: len(_sessions) - keep]
         for k in oldest:
             _sessions.pop(k, None)
+            _ctx_builders.pop(k, None)
 
 
 # ── Plugin hooks ─────────────────────────────────────────────────────────────
 
-def on_session_start(*, session_id: str = "", **_: Any) -> None:
+def on_session_start(*, session_id: str = "", agent: Any = None, **_: Any) -> None:
     if session_id:
         _clean_old_sessions()
         from agent.model_router import RouterSession
         _sessions[session_id] = RouterSession()
+
+        # Create context graph + builder for this session
+        try:
+            from agent.context_tree.graph import ContextGraph
+            from agent.context_tree.builder import ContextTreeBuilder
+            graph = ContextGraph(session_id=session_id)
+            builder = ContextTreeBuilder(graph, session_id=session_id)
+            _ctx_builders[session_id] = (graph, builder)
+
+            # Attach graph to agent so route_call() can use it
+            if agent is not None:
+                agent._context_graph = graph
+                agent._ctx_builder = builder
+
+            logger.debug("model-router: context tree initialised for session %s", session_id)
+        except Exception as exc:
+            logger.debug("model-router: context tree init failed (%s)", exc)
 
 
 def on_pre_llm_call(
@@ -131,13 +172,17 @@ def on_pre_llm_call(
     if os.getenv("HERMES_MODEL_ROUTER", "1") == "0":
         return None
 
-    # Never touch the first call of a user turn — that's the main chat turn
-    is_main_turn = (api_call_count <= 1) and (turn_type or "user") not in _INTERNAL_TURN_TYPES
-    if is_main_turn:
+    # Route ALL calls — main chat, sub-agents, internal calls, everything.
+    # The user's selected model is treated as the tier-3 ceiling; the router
+    # can downgrade to a cheaper tier when the prompt is simple.
+    # To disable routing for specific turn types, add them to a
+    # HERMES_ROUTER_SKIP_TYPES env var (comma-separated).
+    skip_types = os.getenv("HERMES_ROUTER_SKIP_TYPES", "").split(",")
+    if (turn_type or "").strip() in skip_types:
         return None
 
-    # Determine call_type from turn_type
-    call_type = _TURN_TYPE_TO_CALL_TYPE.get(turn_type, "analyze")
+    # Determine call_type from turn_type — main user turns are "plan" (full score)
+    call_type = _TURN_TYPE_TO_CALL_TYPE.get(turn_type, "plan")
 
     # Get session routing state
     session = _get_session(session_id) if session_id else None
@@ -145,9 +190,14 @@ def on_pre_llm_call(
 
     # Boost floor from context tree if available
     try:
-        graph = getattr(agent, "_context_graph", None)
+        graph = _get_ctx_graph(session_id) if session_id else None
+        if graph is None and agent is not None:
+            graph = getattr(agent, "_context_graph", None)
         if graph and len(graph) > 0:
-            from agent.context_tree import complexity_floor as ctx_floor
+            try:
+                from agent.context_tree import complexity_floor as ctx_floor
+            except ImportError:
+                from hermes.agent.context_tree import complexity_floor as ctx_floor
             floor = max(floor, ctx_floor(graph, str(user_message or "")))
     except Exception:
         pass
@@ -161,21 +211,34 @@ def on_pre_llm_call(
         if _is_claude(model, provider):
             from agent.model_router_claude import ClaudeRouter, ClaudeTiers
             router = ClaudeRouter(ClaudeTiers())
+            # Wire context graph for semantic floor
+            graph = _get_ctx_graph(session_id) if session_id else None
+            if graph is None and agent is not None:
+                graph = getattr(agent, "_context_graph", None)
+            if graph is not None:
+                router.set_context_graph(graph)
             routed = router.route(
                 str(user_message or ""),
                 list(conversation_history or []),
                 call_type=call_type,
             )
         else:
-            # Build a throwaway agent-like object carrying the session floor
+            # Build a throwaway agent-like object carrying the session floor + graph
             class _FakeAgent:
-                pass
+                _router_session: Any = None
+                _context_graph: Any = None
             fa = _FakeAgent()
             if session:
                 from agent.model_router import RouterSession
                 fa._router_session = RouterSession(complexity_floor=floor)
             else:
                 fa._router_session = None
+            # Attach context graph so route_call() can use it
+            graph = _get_ctx_graph(session_id) if session_id else None
+            if graph is None and agent is not None:
+                graph = getattr(agent, "_context_graph", None)
+            if graph is not None:
+                fa._context_graph = graph
             routed = route_call(
                 fa,
                 CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE,
@@ -233,6 +296,75 @@ def on_post_llm_call(
         pass
 
 
+def on_tool_result(
+    *,
+    session_id: str = "",
+    tool_name: str = "",
+    tool_input: Any = None,
+    tool_output: Any = None,
+    agent: Any = None,
+    **_: Any,
+) -> None:
+    """Feed tool results to the context tree builder."""
+    if not session_id:
+        return
+    builder = _get_ctx_builder(session_id)
+    if builder is None:
+        return
+    try:
+        builder.on_tool_result(
+            tool_name=tool_name,
+            tool_input=tool_input if isinstance(tool_input, dict) else {},
+            tool_output=str(tool_output or ""),
+            agent=agent,
+        )
+    except Exception:
+        pass  # never break tool execution
+
+
+def on_turn_start(
+    *,
+    session_id: str = "",
+    user_message: str = "",
+    conversation_history: Any = None,
+    agent: Any = None,
+    **_: Any,
+) -> None:
+    """Notify context tree builder of a new turn."""
+    if not session_id:
+        return
+    builder = _get_ctx_builder(session_id)
+    if builder is None:
+        return
+    try:
+        builder.on_turn_start(
+            user_message=user_message or "",
+            history=list(conversation_history or []),
+            agent=agent,
+        )
+    except Exception:
+        pass
+
+
+def on_turn_end(
+    *,
+    session_id: str = "",
+    response: str = "",
+    agent: Any = None,
+    **_: Any,
+) -> None:
+    """Save context graph at end of turn."""
+    if not session_id:
+        return
+    builder = _get_ctx_builder(session_id)
+    if builder is None:
+        return
+    try:
+        builder.on_turn_end(response=response or "", agent=agent)
+    except Exception:
+        pass
+
+
 def _is_claude(model: str, provider: str) -> bool:
     m = (model or "").lower()
     p = (provider or "").lower()
@@ -245,4 +377,7 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
-    logger.info("model-router plugin loaded — internal calls will be routed to cheaper tiers")
+    ctx.register_hook("on_tool_result", on_tool_result)
+    ctx.register_hook("on_turn_start", on_turn_start)
+    ctx.register_hook("on_turn_end", on_turn_end)
+    logger.info("model-router plugin v1.1 loaded — all calls routed, context tree active")

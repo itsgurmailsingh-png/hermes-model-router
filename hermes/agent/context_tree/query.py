@@ -5,7 +5,10 @@ from __future__ import annotations
 import re
 from typing import List
 
-from agent.context_tree.graph import ContextGraph, Node, FILE, TURN, SYMBOL
+try:
+    from agent.context_tree.graph import ContextGraph, Node, FILE, TURN, SYMBOL
+except ImportError:
+    from .graph import ContextGraph, Node, FILE, TURN, SYMBOL
 
 # Weight per node type
 _TYPE_WEIGHT = {FILE: 10, SYMBOL: 8, TURN: 6, "CALL": 4, "TASK": 5}

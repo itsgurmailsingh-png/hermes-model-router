@@ -153,11 +153,20 @@ class _Session:
 # ---------------------------------------------------------------------------
 
 class ClaudeRouter:
-    """Stateful router — one instance per session/conversation."""
+    """Stateful router — one instance per session/conversation.
+
+    If a context graph is attached (via set_context_graph), the semantic
+    complexity floor from the context tree is merged with the session floor.
+    """
 
     def __init__(self, tiers: Optional[ClaudeTiers] = None):
         self.tiers = tiers or ClaudeTiers()
         self._session = _Session()
+        self._context_graph = None
+
+    def set_context_graph(self, graph: Any) -> None:
+        """Attach a ContextGraph instance for semantic floor boosting."""
+        self._context_graph = graph
 
     def route(
         self,
@@ -169,13 +178,29 @@ class ClaudeRouter:
         history = history or []
         turn_score = _score(message, history)
         effective = max(turn_score, self._session.complexity_floor)
+
+        # Boost floor from context tree if available
+        ctx_floor_val = 0
+        if self._context_graph is not None and len(self._context_graph) > 0:
+            try:
+                try:
+                    from agent.context_tree import complexity_floor as _ctx_floor
+                except ImportError:
+                    from hermes.agent.context_tree import complexity_floor as _ctx_floor
+                ctx_floor_val = _ctx_floor(self._context_graph, message)
+                effective = max(effective, ctx_floor_val)
+            except Exception:
+                pass
+
         offset = CALL_TYPE_OFFSET.get(call_type, 0)
         final = max(0, min(100, effective + offset))
         model = self.tiers.for_score(final)
 
         logger.debug(
-            "claude_router: call_type=%s msg_score=%d floor=%d final=%d → %s",
-            call_type, turn_score, self._session.complexity_floor, final, model,
+            "claude_router: call_type=%s msg_score=%d floor=%d ctx_floor=%d "
+            "final=%d → %s",
+            call_type, turn_score, self._session.complexity_floor,
+            ctx_floor_val, final, model,
         )
         return model
 
@@ -206,6 +231,8 @@ def route_turn_claude(
     """Drop-in replacement for route_turn() when provider is anthropic.
 
     Attaches a ClaudeRouter to agent._claude_router on first call.
+    If agent._context_graph exists, attaches it to the router for
+    semantic floor boosting.
     Returns None when HERMES_MODEL_ROUTER=0.
     """
     if os.getenv("HERMES_MODEL_ROUTER", "1") == "0":
@@ -215,5 +242,10 @@ def route_turn_claude(
     if router is None:
         router = ClaudeRouter(tiers or _DEFAULT_TIERS)
         agent._claude_router = router
+
+    # Wire context graph if available
+    graph = getattr(agent, "_context_graph", None)
+    if graph is not None:
+        router.set_context_graph(graph)
 
     return router.route(user_message, history or [], call_type="plan")
