@@ -98,7 +98,10 @@ _ctx_builders: dict[str, Any] = {}
 
 
 def _get_session(session_id: str) -> Any:
-    from agent.model_router import RouterSession
+    try:
+        from agent.model_router import RouterSession
+    except ImportError:
+        from hermes.agent.model_router import RouterSession
     if session_id not in _sessions:
         _sessions[session_id] = RouterSession()
     return _sessions[session_id]
@@ -134,13 +137,20 @@ def _clean_old_sessions(keep: int = 32):
 def on_session_start(*, session_id: str = "", agent: Any = None, **_: Any) -> None:
     if session_id:
         _clean_old_sessions()
-        from agent.model_router import RouterSession
+        try:
+            from agent.model_router import RouterSession
+        except ImportError:
+            from hermes.agent.model_router import RouterSession
         _sessions[session_id] = RouterSession()
 
         # Create context graph + builder for this session
         try:
-            from agent.context_tree.graph import ContextGraph
-            from agent.context_tree.builder import ContextTreeBuilder
+            try:
+                from agent.context_tree.graph import ContextGraph
+                from agent.context_tree.builder import ContextTreeBuilder
+            except ImportError:
+                from hermes.agent.context_tree.graph import ContextGraph
+                from hermes.agent.context_tree.builder import ContextTreeBuilder
             graph = ContextGraph(session_id=session_id)
             builder = ContextTreeBuilder(graph, session_id=session_id)
             _ctx_builders[session_id] = (graph, builder)
@@ -204,12 +214,18 @@ def on_pre_llm_call(
 
     # Route
     try:
-        from agent.model_router import route_call, CallType, ModelTiers
+        try:
+            from agent.model_router import route_call, CallType, ModelTiers
+        except ImportError:
+            from hermes.agent.model_router import route_call, CallType, ModelTiers
         tiers = ModelTiers()
 
         # Detect if user is on Claude — use Claude tiers instead
         if _is_claude(model, provider):
-            from agent.model_router_claude import ClaudeRouter, ClaudeTiers
+            try:
+                from agent.model_router_claude import ClaudeRouter, ClaudeTiers
+            except ImportError:
+                from hermes.agent.model_router_claude import ClaudeRouter, ClaudeTiers
             router = ClaudeRouter(ClaudeTiers())
             # Wire context graph for semantic floor
             graph = _get_ctx_graph(session_id) if session_id else None
@@ -229,8 +245,11 @@ def on_pre_llm_call(
                 _context_graph: Any = None
             fa = _FakeAgent()
             if session:
-                from agent.model_router import RouterSession
-                fa._router_session = RouterSession(complexity_floor=floor)
+                try:
+                    from agent.model_router import RouterSession as _RS
+                except ImportError:
+                    from hermes.agent.model_router import RouterSession as _RS
+                fa._router_session = _RS(complexity_floor=floor)
             else:
                 fa._router_session = None
             # Attach context graph so route_call() can use it
@@ -289,7 +308,10 @@ def on_post_llm_call(
         return
     session = _get_session(session_id)
     try:
-        from agent.model_router import _score_message
+        try:
+            from agent.model_router import _score_message
+        except ImportError:
+            from hermes.agent.model_router import _score_message
         score = _score_message(str(user_message or ""), list(conversation_history or []))
         session.update(score, [], 0)
     except Exception:
