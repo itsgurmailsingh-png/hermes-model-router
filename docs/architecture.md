@@ -1,4 +1,4 @@
-# Architecture — hermes-model-router v1.1
+# Architecture — hermes-model-router v1.2
 
 ## Overview
 
@@ -7,6 +7,8 @@ The model router is a two-layer system that classifies each LLM call before it r
 The same scoring logic runs in both Hermes (Python) and Claude Code (Node.js/MJS), with identical tier boundaries, so routing decisions are predictable regardless of which runtime you are in.
 
 **v1.1 changes**: ALL calls are now routed (main chat included, not just internal calls). The context tree is wired into the router — it's no longer "planned v2", it's live.
+
+**v1.2 changes**: Feedback loop (success/failure tracking that adjusts the floor), smarter scoring (trivial scope / micro-task / short+keyword penalties), custom extensible tags loaded from JSON, complexity decay by file recency, configurable context floor cap, manual tier override (`/t0`–`/t3`), session-aware plugin (`_RouterAgent` replacing `_FakeAgent`), and a routing monitor script.
 
 ---
 
@@ -46,9 +48,32 @@ Any fenced code block (`` ``` ``) in the prompt adds 15 points. The rationale: i
 
 If the prompt references two or more distinct file paths (heuristic: strings containing `/` or ending in a known extension), +15 is added. Multi-file tasks require cross-file reasoning which cheaper models handle poorly.
 
+### Trivial scope detection (v1.2, -15)
+
+If the message contains any of: `just`, `only`, `one`, `quick`, `simple`, `small` → -15. These words signal a small task that doesn't need a big model. Matched case-insensitively on word boundaries.
+
+### Micro-task detection (v1.2, -20)
+
+If the message contains any of: `typo`, `rename`, `comment`, `format`, `indent`, `spelling` → -20. These are mechanical edits any tier can handle. Matched case-insensitively on word boundaries.
+
+### Short+keyword penalty (v1.2, -10)
+
+If a high-signal keyword is present but the message is < 60 characters → -10. A short message with one keyword rarely needs a big model — the keyword is usually incidental context, not a complexity signal.
+
+### Scoring examples (v1.2)
+
+| Message | v1.1 score | v1.2 score | Breakdown |
+|---------|-----------|-----------|-----------|
+| "refactor this one variable" | 38 | 23 | base 30 + "refactor" +8 + "one" trivial scope -15 = 23 |
+| "just rename this" | 20 | 5 | base 30 + "just" trivial scope -15 + "rename" micro-task -20 = 5 (floored at 5) |
+
 ### Low-signal override
 
 If the message matches a greeting/acknowledgement pattern (`hi`, `thanks`, `ok`, `done`, etc.) it scores 5, regardless of other features. This ensures trivial messages route to the cheapest tier — unless the context tree floor overrides it.
+
+### Manual override (v1.2)
+
+Prefix a message with `/t0`, `/t1`, `/t2`, or `/t3` to force a specific tier for one call. This bypasses all scoring, floors, and offsets. The prefix is stripped from the message before routing. Useful for testing or when you know better than the router.
 
 ### Tier boundaries (actual code)
 
@@ -68,11 +93,37 @@ The session floor prevents mid-session regression: once a complex task has been 
 - Floor starts at 0.
 - After each call, the floor is updated: `floor = max(floor, turn_score)`.
 - Floor decays by 5 per simple turn (score < current floor).
-- Floor is stored in memory per session (`RouterSession`), not persisted across restarts.
+- **Feedback adjustments (v1.2)**: failures boost the floor by +10 each (capped at +30 total). Successes decay it by -3. See [Feedback Loop](#feedback-loop-v12) below.
+- Floor is stored in memory per session (`RouterSession`), with feedback persisted to `~/.hermes/router-logs/feedback.json`.
 
 This means:
 - A coding session that hit score 68 will not route the next turn below 63.
 - A long chain of simple turns (acknowledgements, confirmations) eventually lets the floor decay back to 0.
+- A run of failures will keep the router on higher tiers until the model succeeds again (v1.2).
+
+---
+
+## Feedback Loop (v1.2)
+
+After each routed call, the router tracks whether the call succeeded or failed. This feedback adjusts the session floor so that repeated failures push the router toward more capable models, while successes let it relax back down.
+
+### Mechanism
+
+- **Failure**: `floor += 10` (boost), capped at +30 above the base floor.
+- **Success**: `floor -= 3` (decay).
+- Feedback is persisted to `~/.hermes/router-logs/feedback.json` and loaded on session start.
+
+### API
+
+```python
+record_call_result(agent, call_type, success)   # Called after each routed call
+save_feedback(agent)                              # Persist feedback to disk
+load_feedback()                                   # Load persisted feedback (called on session start)
+```
+
+### What it prevents
+
+If a model keeps failing on a task (e.g. a small model produces broken code that needs re-routing), the feedback loop raises the floor so subsequent calls go to a more capable tier. Without feedback, the router would keep trying the same cheap model and failing.
 
 ---
 
@@ -80,9 +131,15 @@ This means:
 
 The context tree maintains a live semantic graph of the agent's working context. It tracks:
 
-- **FILE nodes** — every file read or written, with auto-extracted domain tags (auth, security, database, api, test, config, ui, infra) and a complexity score (0–100) based on lines, functions, classes, imports, and branching.
+- **FILE nodes** — every file read or written, with auto-extracted domain tags (auth, security, database, api, test, config, ui, infra, ml, graphics, networking, game) and a complexity score (0–100) based on lines, functions, classes, imports, and branching.
 - **TURN nodes** — each user message, tagged by domain.
 - **CALL nodes** — tool calls (bash, delegate_task, search_files, patch, terminal).
+
+### Custom tags (v1.2)
+
+Tag patterns are no longer hardcoded. They are loaded from `hermes/agent/context_tree/tags.json` — a user-extensible JSON file. v1.2 added `ml`, `graphics`, `networking`, and `game` domains. Both `builder.py` (which creates nodes) and `query.py` (which scores them) load from the same file, so adding a new domain tag in the JSON immediately affects both scoring and node creation.
+
+Hot-reload via `reload_tags()` — call it after editing `tags.json` to pick up changes without restarting the session.
 
 ### How the floor is computed
 
@@ -91,9 +148,22 @@ The context tree maintains a live semantic graph of the agent's working context.
 1. Extract domain tags from the prompt (e.g. "fix the auth token" → {auth}).
 2. Score all graph nodes by tag overlap (×20) + node type weight (FILE=10, SYMBOL=8, TURN=6) + recency bonus (×15 if in last 10 touched) + complexity (×0.1).
 3. Take the top-4 scored nodes with score > 0.
-4. Floor = average of the top node's complexity and the mean complexity of the 4 nodes, capped at 70.
+4. Floor = average of the top node's complexity and the mean complexity of the 4 nodes, capped at `HERMES_ROUTER_CTX_FLOOR_CAP` (default 70). Set this env var to 90 to let context alone push a call to Tier 3.
 
 This floor is merged with the session floor (`max(session_floor, ctx_floor)`) before applying the call-type offset.
+
+### Complexity decay (v1.2)
+
+Files not touched recently contribute less to the context floor. Each node's complexity is scaled by its recency position in the touched history:
+
+| Recency (position in touched history) | Contribution |
+|----------------------------------------|-------------|
+| Recent (last 10 touched) | 100% |
+| 10–30 back | 80% |
+| 30–50 back | 60% |
+| Beyond 50 | 40% |
+
+This prevents stale files from inflating the floor long after you've moved on to something else.
 
 ### What this prevents
 
@@ -246,16 +316,45 @@ Saved to `~/.hermes/router-logs/context-graph.json` after every turn:
 
 ---
 
-## Plugin Hooks (v1.1)
+## Plugin Hooks (v1.2)
 
 | Hook | When | What it does |
 |------|------|-------------|
-| `on_session_start` | Session begins | Creates ContextGraph + ContextTreeBuilder, attaches to agent |
-| `pre_llm_call` | Before every LLM call | Scores message, applies session + context tree floor, routes to tier, returns `{"model": name}` |
-| `post_llm_call` | After each main turn | Updates session complexity floor from message score |
+| `on_session_start` | Session begins | Creates ContextGraph + ContextTreeBuilder, attaches to agent. Creates `_RouterAgent` (v1.2) carrying the actual RouterSession + context graph. Loads persisted feedback on first call. |
+| `pre_llm_call` | Before every LLM call | Scores message, applies session + context tree floor, routes to tier, returns `{"model": name}`. Checks for manual override prefix (`/t0`–`/t3`). |
+| `post_llm_call` | After each main turn | Updates session complexity floor from message score. Records call result for feedback loop (v1.2). |
 | `on_tool_result` | After every tool call | Feeds tool result to ContextTreeBuilder (read/write/bash/delegate/search/patch) |
 | `on_turn_start` | User sends message | Adds TURN node to graph, sets as current turn |
-| `on_turn_end` | Turn completes | Saves graph to `~/.hermes/router-logs/context-graph.json` |
+| `on_turn_end` | Turn completes | Saves graph to `~/.hermes/router-logs/context-graph.json`. Saves feedback to `~/.hermes/router-logs/feedback.json` (v1.2). |
+
+### Session-aware plugin (v1.2)
+
+v1.1 used a `_FakeAgent` stub that didn't carry real session state. v1.2 replaces it with `_RouterAgent`, which carries the actual `RouterSession` and context graph. This means the plugin has access to the real session floor, feedback state, and context tree — not a placeholder. Persisted feedback is loaded on the first call of each session.
+
+---
+
+## Routing Monitor (v1.2)
+
+`scripts/router_monitor.py` is a CLI tool for inspecting routing behavior in real time. It reads:
+
+- `~/.hermes/router-logs/routing.jsonl` — routing decisions
+- `~/.hermes/router-logs/feedback.json` — feedback state
+- `~/.hermes/router-logs/context-graph.json` — current context graph
+
+### Output
+
+- **Model distribution** — how many calls went to each tier/model
+- **Call types** — breakdown by call type (plan, codegen, analyze, etc.)
+- **Feedback state** — current floor adjustments from failures/successes
+- **Recent decisions** — last N routing decisions with color-coded tiers
+
+### Usage
+
+```bash
+python scripts/router_monitor.py              # summary + last 20 decisions
+python scripts/router_monitor.py --last 50    # last 50 decisions
+python scripts/router_monitor.py --watch      # live mode, refreshes every 5s
+```
 
 ---
 
@@ -264,6 +363,6 @@ Saved to `~/.hermes/router-logs/context-graph.json` after every turn:
 The context tree has the data structure for cost tracking (Node.meta can hold tokens_in/out), but this is not yet wired. Planned:
 
 1. **Cost attribution** — each node tracks estimated tokens and cost. CLI report shows cost-per-file, cost-per-subtask.
-2. **Adaptive keyword weights** — after each session, actual model performance updates keyword weights via a simple online learning rule.
+2. **Adaptive keyword weights** — after each session, actual model performance updates keyword weights via a simple online learning rule. (Partially addressed by the v1.2 feedback loop, which adjusts the floor — not individual keyword weights — based on success/failure.)
 3. **SYMBOL nodes** — track individual functions/classes, not just files.
 4. **DEPENDS_ON edges** — traverse the DAG for inherited complexity (if Call B depends on Call A's output, B inherits A's floor even if B's text is simple).

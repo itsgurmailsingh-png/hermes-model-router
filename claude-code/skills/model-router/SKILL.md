@@ -29,8 +29,13 @@ Add up:
 - Has code block in prompt: **+15**
 - Multiple files involved: **+15**
 - Questions: **+4 each, max +10**
+- **Trivial scope (v1.2)**: message contains "just", "only", "one", "quick", "simple", "small" → **-15**
+- **Micro-task (v1.2)**: message contains "typo", "rename", "comment", "format", "indent", "spelling" → **-20**
+- **Short+keyword (v1.2)**: keyword present but message < 60 chars → **-10**
 
 Low-signal override: greetings/acknowledgements ("hi", "ok", "thanks", "done") → score 5.
+
+**Manual override (v1.2)**: prefix message with `/t0`, `/t1`, `/t2`, `/t3` to force a tier for one call — bypasses all scoring.
 
 ## Context Tree Floor
 
@@ -62,7 +67,8 @@ Session floor: if the current session has been handling complex tasks (score > 6
 "write tests for the router"          → score 55  → sonnet
 "summarize what changed"              → score 15  → haiku
 "design the database schema"          → score 75  → opus
-"fix this one typo"                   → score 20  → haiku (but ctx floor may push to sonnet)
+"fix this one typo"                   → score 5   → haiku (v1.2: "one" -15, "typo" -20; ctx floor may still push up)
+"just rename this"                    → score 5   → haiku (v1.2: "just" -15, "rename" -20)
 ```
 
 ## How to Apply

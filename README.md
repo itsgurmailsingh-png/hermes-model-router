@@ -33,8 +33,18 @@ Each call is scored before routing:
 - High-signal keywords (refactor, architect, implement, debug...): +8 each, max +30
 - Code block in prompt: +15
 - Multi-file task: +15
+- **Trivial scope detection** (v1.2): message contains "just", "only", "one", "quick", "simple", "small" → -15. Signals a small task that doesn't need a big model.
+- **Micro-task detection** (v1.2): message contains "typo", "rename", "comment", "format", "indent", "spelling" → -20. Signals a mechanical edit that any tier can handle.
+- **Short+keyword penalty** (v1.2): a high-signal keyword is present but the message is < 60 chars → -10. Short messages with one keyword rarely need a big model.
 - Session complexity floor: never routes below the floor mid-session
 - **Context tree floor**: semantic floor from files you've been touching — prevents downgrade even when the message itself is simple
+
+#### Scoring examples (v1.2)
+
+| Message | v1.1 score | v1.2 score | Note |
+|---------|-----------|-----------|------|
+| "refactor this one variable" | 38 | 23 | "refactor" keyword (+8) but "one" triggers trivial scope (-15) |
+| "just rename this" | 20 | 5 | "just" triggers trivial scope (-15) and "rename" triggers micro-task (-20) |
 
 ### Tier boundaries (actual code)
 | Score | Tier | Ollama | Claude |
@@ -58,11 +68,36 @@ Each call is scored before routing:
 ### Context tree floor
 
 The context tree maintains a live graph of:
-- **FILE nodes** — every file read or written (tags: auth, security, database, api, test, config, ui, infra)
+- **FILE nodes** — every file read or written (tags: auth, security, database, api, test, config, ui, infra, ml, graphics, networking, game — see `hermes/agent/context_tree/tags.json` for the full extensible list)
 - **TURN nodes** — each user message
 - **CALL nodes** — tool calls (bash, delegate_task, search_files, patch, terminal)
 
+Tag patterns are loaded from `hermes/agent/context_tree/tags.json` (user-extensible JSON, hot-reloadable via `reload_tags()`). Both `builder.py` and `query.py` load from the same file. v1.2 added `ml`, `graphics`, `networking`, and `game` domains.
+
 When routing a new message, the query engine scores all nodes by tag overlap + recency + complexity, returns the top-k relevant nodes, and computes a semantic complexity floor. This floor is merged with the session floor — so if you've been working on `auth.py` (complexity 72) and say "fix the typo", the router keeps you on `devstral-small-2:24b` instead of downgrading to `gemma3:12b`.
+
+### Complexity decay (v1.2)
+
+Files not touched recently contribute less to the context floor:
+
+| Recency (position in touched history) | Contribution |
+|----------------------------------------|-------------|
+| Recent (last 10 touched) | 100% |
+| 10–30 back | 80% |
+| 30–50 back | 60% |
+| Beyond 50 | 40% |
+
+This prevents stale files from inflating the floor long after you've moved on.
+
+### Feedback loop (v1.2)
+
+After each routed call, the router tracks success/failure. Failures boost the floor (+10 each, capped at +30). Successes decay it (-3). Feedback persists to `~/.hermes/router-logs/feedback.json` and is loaded on session start.
+
+API: `record_call_result(agent, call_type, success)`, `save_feedback(agent)`, `load_feedback()`.
+
+### Manual override (v1.2)
+
+Prefix a message with `/t0`, `/t1`, `/t2`, or `/t3` to force a specific tier for one call. This bypasses all scoring and floors. Useful for testing or when you know better than the router.
 
 | Message | No context tree | With context tree (auth.py touched) |
 |---------|-----------------|--------------------------------------|
@@ -141,6 +176,7 @@ The Claude Code hook reads `~/.hermes/router-logs/context-graph.json` (written b
 | `HERMES_ROUTER_TIER1` | `gemma3:12b` | Tier 1 model |
 | `HERMES_ROUTER_TIER2` | `devstral-small-2:24b` | Tier 2 model |
 | `HERMES_ROUTER_TIER3` | `glm-5.2` | Tier 3 model |
+| `HERMES_ROUTER_CTX_FLOOR_CAP` | `70` | Cap for context tree floor contribution. Set to `90` to let context alone push a call to Tier 3 |
 | `CLAUDE_MODEL_ROUTER` | `1` | Kill switch for Claude Code hook |
 | `CLAUDE_ROUTER_TIER0–3` | Claude defaults | Claude tier overrides |
 
@@ -161,25 +197,49 @@ node ~/.claude/helpers/router-analyze.mjs --raw
 
 The Hermes plugin also saves the context graph to `~/.hermes/router-logs/context-graph.json` after every turn — inspect it to see what files/tags/complexity the router sees.
 
+### Routing monitor (v1.2)
+
+`scripts/router_monitor.py` reads `routing.jsonl` + `feedback.json` + `context-graph.json` and shows model distribution, call types, feedback state, and recent decisions with color-coded tiers.
+
+```bash
+# Summary + last 20 decisions
+python scripts/router_monitor.py
+
+# Last 50 decisions only
+python scripts/router_monitor.py --last 50
+
+# Live watch mode (refreshes every 5s)
+python scripts/router_monitor.py --watch
+```
+
 ## Architecture
 
 ```
 User Message
      │
      ▼
+Manual override? (/t0–/t3)
+  • Yes → skip all scoring, force tier
+  • No  → continue
+     │
+     ▼
 Layer 1: Feature scoring (~1ms, free)
   • Keyword hits, length, code presence
+  • Trivial scope / micro-task penalties (v1.2)
   • Context dependency signals
      │
      ▼
 Session floor applied
   • Never routes below floor mid-session
   • Floor decays 5pts per simple turn
+  • Feedback boosts: +10/failure (cap +30), -3/success (v1.2)
      │
      ▼
 Context tree floor applied
   • Semantic floor from files touched (auth, db, api...)
+  • Complexity decay by recency (v1.2)
   • Merged with session floor (max wins)
+  • Capped at HERMES_ROUTER_CTX_FLOOR_CAP (default 70)
      │
      ▼
 Call-type offset applied
@@ -189,6 +249,11 @@ Call-type offset applied
      │
      ▼
 Tier → Model
+     │
+     ▼
+Feedback recorded (v1.2)
+  • record_call_result(agent, call_type, success)
+  • Persists to ~/.hermes/router-logs/feedback.json
 ```
 
 ## What CAN and CANNOT be routed
