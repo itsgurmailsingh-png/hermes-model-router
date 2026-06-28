@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# claude-routed — Launch Claude Code through the routing proxy.
+#
+# Starts the proxy in the background, sets ANTHROPIC_BASE_URL to point
+# at it, launches Claude Code, and cleans up when Claude exits.
+#
+# Usage:
+#   claude-routed              # normal launch
+#   claude-routed --watch      # also show live routing decisions
+#
+# Kill switch (bypass proxy, use Claude directly):
+#   CLAUDE_PROXY_DISABLE=1 claude-routed
+
+set -euo pipefail
+
+PROXY_SCRIPT="${HOME}/colab-repos/my-router/scripts/claude_proxy.py"
+PROXY_PORT="${CLAUDE_PROXY_PORT:-8082}"
+PROXY_PID=""
+
+# ── Cleanup on exit ───────────────────────────────────────────────────────────
+cleanup() {
+    if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        kill "$PROXY_PID" 2>/dev/null || true
+        wait "$PROXY_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# ── Start the proxy ───────────────────────────────────────────────────────────
+echo "Starting routing proxy on port $PROXY_PORT..."
+python3 "$PROXY_SCRIPT" &
+PROXY_PID=$!
+
+# Wait for proxy to be ready
+for i in $(seq 1 20); do
+    if curl -s "http://localhost:$PROXY_PORT/health" >/dev/null 2>&1; then
+        echo "Proxy ready (PID $PROXY_PID)"
+        break
+    fi
+    sleep 0.2
+    if [ "$i" -eq 20 ]; then
+        echo "ERROR: Proxy failed to start"
+        exit 1
+    fi
+done
+
+# Show proxy info
+curl -s "http://localhost:$PROXY_PORT/health" | python3 -m json.tool 2>/dev/null || true
+
+# ── Launch Claude Code ────────────────────────────────────────────────────────
+export ANTHROPIC_BASE_URL="http://localhost:$PROXY_PORT"
+
+echo ""
+echo "Launching Claude Code with routing enabled..."
+echo "  Scoring: see http://localhost:$PROXY_PORT/stats"
+echo "  Feedback: curl -X POST http://localhost:$PROXY_PORT/feedback -d '{\"call_type\":\"plan\",\"success\":false}'"
+echo "  Kill switch: CLAUDE_PROXY_DISABLE=1"
+echo ""
+
+# If --watch flag, start the monitor in a split
+if [ "${1:-}" = "--watch" ]; then
+    # Start monitor in background terminal
+    python3 "${HOME}/colab-repos/my-router/scripts/router_monitor.py" --watch 5 &
+    MONITOR_PID=$!
+    trap 'kill "$PROXY_PID" "$MONITOR_PID" 2>/dev/null || true' EXIT INT TERM
+fi
+
+# Launch Claude Code (pass through any remaining args)
+claude "${@}" || true
+
+# cleanup runs via trap
