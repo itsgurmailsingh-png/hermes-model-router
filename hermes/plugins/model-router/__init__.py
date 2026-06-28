@@ -220,6 +220,12 @@ def on_pre_llm_call(
             from hermes.agent.model_router import route_call, CallType, ModelTiers, RouterSession, load_feedback
         tiers = ModelTiers()
 
+        # Defaults for logging (set in both branches below)
+        _raw_score = None
+        _ctx_floor_val = 0
+        _fb_floor = 0
+        _final = None
+
         # Detect if user is on Claude — use Claude tiers instead
         if _is_claude(model, provider):
             try:
@@ -260,6 +266,32 @@ def on_pre_llm_call(
             if graph is None and agent is not None:
                 graph = getattr(agent, "_context_graph", None)
             ra = _RouterAgent(session_obj, graph)
+
+            # Compute score for logging
+            try:
+                try:
+                    from agent.model_router import _score_message
+                except ImportError:
+                    from hermes.agent.model_router import _score_message
+                _raw_score = _score_message(str(user_message or ""), list(conversation_history or []))
+            except Exception:
+                _raw_score = None
+
+            # Context tree floor for logging
+            _ctx_floor_val = 0
+            if graph is not None and len(graph) > 0:
+                try:
+                    try:
+                        from agent.context_tree import complexity_floor as _cf
+                    except ImportError:
+                        from hermes.agent.context_tree import complexity_floor as _cf
+                    _ctx_floor_val = _cf(graph, str(user_message or ""))
+                except Exception:
+                    pass
+
+            # Feedback floor for logging
+            _fb_floor = session_obj.feedback_floor(call_type) if session_obj else 0
+
             routed = route_call(
                 ra,
                 CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE,
@@ -267,6 +299,20 @@ def on_pre_llm_call(
                 list(conversation_history or []),
                 tiers,
             )
+
+            # Compute final score for logging
+            _final = None
+            if _raw_score is not None:
+                _effective = max(_raw_score, session_obj.complexity_floor if session_obj else 0)
+                _effective = max(_effective, _ctx_floor_val)
+                if _fb_floor > 0:
+                    _effective = max(_effective, _raw_score + _fb_floor)
+                try:
+                    from agent.model_router import CALL_TYPE_OFFSET as _CTO
+                except ImportError:
+                    from hermes.agent.model_router import CALL_TYPE_OFFSET as _CTO
+                _offset = _CTO.get(CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE, 0)
+                _final = max(0, min(100, _effective + _offset))
 
         changed = routed and routed != model
         _log_decision({
@@ -276,6 +322,10 @@ def on_pre_llm_call(
             "turn_type":   turn_type,
             "api_call":    api_call_count,
             "call_type":   call_type,
+            "raw_score":   _raw_score,
+            "ctx_floor":   _ctx_floor_val,
+            "feedback":    _fb_floor,
+            "final_score": _final,
             "model_was":   model or None,
             "model_used":  routed if changed else model,
             "routed":      bool(changed),
