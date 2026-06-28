@@ -225,6 +225,7 @@ def on_pre_llm_call(
         _ctx_floor_val = 0
         _fb_floor = 0
         _final = None
+        _has_image = False  # default to False
 
         # Detect if user is on Claude — use Claude tiers instead
         if _is_claude(model, provider):
@@ -292,6 +293,16 @@ def on_pre_llm_call(
             # Feedback floor for logging
             _fb_floor = session_obj.feedback_floor(call_type) if session_obj else 0
 
+            # Image detection: check if any message has an image attachment
+            _has_image = False
+            if isinstance(user_message, dict) and user_message.get("attachments"):
+                _has_image = any(att.get("type") == "image" for att in user_message["attachments"])
+            elif conversation_history:
+                for msg in conversation_history:
+                    if isinstance(msg, dict) and msg.get("attachments"):
+                        _has_image = any(att.get("type") == "image" for att in msg["attachments"])
+                        break
+
             routed = route_call(
                 ra,
                 CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE,
@@ -314,6 +325,21 @@ def on_pre_llm_call(
                 _offset = _CTO.get(CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE, 0)
                 _final = max(0, min(100, _effective + _offset))
 
+            # Image routing: if there's an image, force tier 3 (vision model)
+            # or tier 2 if no vision model is available
+            if _has_image:
+                # Try to find a vision model in the tiers
+                vision_model = None
+                for tier in [tiers.tier3, tiers.tier2, tiers.tier1, tiers.tier0]:
+                    if tier and any(x in tier.lower() for x in ['llava', 'bakllava', 'multimodal', 'vision']):
+                        vision_model = tier
+                        break
+                if vision_model:
+                    routed = vision_model
+                else:
+                    # No vision model — use tier 3 (highest available)
+                    routed = tiers.tier3
+
         changed = routed and routed != model
         _log_decision({
             "ts":          datetime.now(timezone.utc).isoformat(),
@@ -330,6 +356,7 @@ def on_pre_llm_call(
             "model_used":  routed if changed else model,
             "routed":      bool(changed),
             "prompt":      str(user_message or "")[:120],
+            "has_image":   _has_image,
         })
 
         if changed:
