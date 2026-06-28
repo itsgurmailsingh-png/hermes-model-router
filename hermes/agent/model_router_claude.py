@@ -109,6 +109,16 @@ _LOW_SIGNALS = re.compile(
     r"got it|sounds good|perfect|nice|cool)\s*[!.]?\s*$",
     re.IGNORECASE,
 )
+_TRIVIAL_SCOPE = re.compile(
+    r"\b(just|only|quick|simple|small|one|single|that one|this one|the one|"
+    r"that specific|just that|just this)\b",
+    re.IGNORECASE,
+)
+_MICRO_TASKS = re.compile(
+    r"\b(typo|rename|comment|import|semicolon|bracket|whitespace|format|"
+    r"indent|spelling|log statement|print statement)\b",
+    re.IGNORECASE,
+)
 _HAS_CODE = re.compile(r"```|\bdef \b|\bclass \b|\bfunction\b|\bimport \b", re.IGNORECASE)
 _CONTEXT_REF = re.compile(r"\b(it|that|this|the above|the previous|as before|same as)\b", re.IGNORECASE)
 
@@ -120,7 +130,8 @@ def _score(message: str, history: List[dict]) -> int:
 
     score = 30
     score += min(20, len(msg) // 40)
-    score += min(30, len(_HIGH_SIGNALS.findall(msg)) * 8)
+    hits = len(_HIGH_SIGNALS.findall(msg))
+    score += min(30, hits * 8)
     if _HAS_CODE.search(msg):
         score += 15
     score += min(10, msg.count("?") * 4)
@@ -128,7 +139,16 @@ def _score(message: str, history: List[dict]) -> int:
         score += 10
     score += min(10, len(history) // 3)
     score += min(15, sum(1 for m in history[-6:] if m.get("role") == "tool") * 5)
-    return min(100, score)
+
+    # Trivial scope reduction
+    if _TRIVIAL_SCOPE.search(msg):
+        score -= 15
+    if _MICRO_TASKS.search(msg):
+        score -= 20
+    if hits > 0 and len(msg) < 60:
+        score -= 10
+
+    return max(0, min(100, score))
 
 
 # ---------------------------------------------------------------------------

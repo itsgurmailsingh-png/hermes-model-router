@@ -215,9 +215,9 @@ def on_pre_llm_call(
     # Route
     try:
         try:
-            from agent.model_router import route_call, CallType, ModelTiers
+            from agent.model_router import route_call, CallType, ModelTiers, RouterSession, load_feedback
         except ImportError:
-            from hermes.agent.model_router import route_call, CallType, ModelTiers
+            from hermes.agent.model_router import route_call, CallType, ModelTiers, RouterSession, load_feedback
         tiers = ModelTiers()
 
         # Detect if user is on Claude — use Claude tiers instead
@@ -239,27 +239,29 @@ def on_pre_llm_call(
                 call_type=call_type,
             )
         else:
-            # Build a throwaway agent-like object carrying the session floor + graph
-            class _FakeAgent:
-                _router_session: Any = None
-                _context_graph: Any = None
-            fa = _FakeAgent()
-            if session:
+            # Use the session's RouterSession directly — no FakeAgent needed.
+            # We create a minimal agent-like object that carries the session
+            # state and context graph, both pulled from the plugin's session dict.
+            session_obj = _get_session(session_id) if session_id else RouterSession()
+            # Load persisted feedback into the session on first use
+            if not session_obj.feedback and session_obj.turns == 0:
                 try:
-                    from agent.model_router import RouterSession as _RS
-                except ImportError:
-                    from hermes.agent.model_router import RouterSession as _RS
-                fa._router_session = _RS(complexity_floor=floor)
-            else:
-                fa._router_session = None
-            # Attach context graph so route_call() can use it
+                    session_obj.feedback = load_feedback()
+                except Exception:
+                    pass
+
+            class _RouterAgent:
+                """Minimal agent carrying session + graph for route_call()."""
+                def __init__(self, sess, graph):
+                    self._router_session = sess
+                    self._context_graph = graph
+
             graph = _get_ctx_graph(session_id) if session_id else None
             if graph is None and agent is not None:
                 graph = getattr(agent, "_context_graph", None)
-            if graph is not None:
-                fa._context_graph = graph
+            ra = _RouterAgent(session_obj, graph)
             routed = route_call(
-                fa,
+                ra,
                 CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE,
                 str(user_message or ""),
                 list(conversation_history or []),

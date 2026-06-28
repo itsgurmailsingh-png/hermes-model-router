@@ -37,6 +37,7 @@ import re
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,9 @@ class RouterSession:
     files_touched: int = 0
     turns: int = 0
     last_score: int = 0
+    # Feedback loop: track failures per call_type to adapt routing
+    # {call_type_str: {"fails": int, "total": int, "floor_boost": int}}
+    feedback: dict[str, dict] = field(default_factory=dict)
 
     def update(self, turn_score: int, tools: list[str], files_written: int):
         self.turns += 1
@@ -131,6 +135,30 @@ class RouterSession:
         else:
             # Decay: after a simple turn the floor drops by 5 (not instantly)
             self.complexity_floor = max(0, self.complexity_floor - 5)
+
+    def record_result(self, call_type: str, success: bool) -> None:
+        """Record whether a routed call succeeded or failed.
+
+        On failure, boosts the floor for that call_type so the router
+        won't make the same mistake. On success, gradually decays the boost.
+        """
+        ct = call_type or "plan"
+        entry = self.feedback.setdefault(ct, {"fails": 0, "total": 0, "floor_boost": 0})
+        entry["total"] += 1
+        if not success:
+            entry["fails"] += 1
+            # Each failure adds 10 to the floor boost (caps at 30)
+            entry["floor_boost"] = min(30, entry["floor_boost"] + 10)
+        else:
+            # Each success decays the boost by 3
+            entry["floor_boost"] = max(0, entry["floor_boost"] - 3)
+
+    def feedback_floor(self, call_type: str) -> int:
+        """Return the feedback-derived floor boost for a call type."""
+        entry = self.feedback.get(call_type or "plan")
+        if not entry:
+            return 0
+        return entry.get("floor_boost", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +178,21 @@ _HIGH_SIGNALS = re.compile(
 _LOW_SIGNALS = re.compile(
     r"^\s*(hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|great|done|"
     r"got it|sounds good|perfect|nice|cool)\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+
+# Trivial scope reducers — "just", "only", "one", "quick" + a single noun
+# These signal the task is small even if a keyword like "refactor" is present
+_TRIVIAL_SCOPE = re.compile(
+    r"\b(just|only|quick|simple|small|one|single|that one|this one|the one|"
+    r"that specific|just that|just this)\b",
+    re.IGNORECASE,
+)
+
+# "fix the typo", "rename this variable", "add a comment" — micro-tasks
+_MICRO_TASKS = re.compile(
+    r"\b(typo|rename|comment|import|semicolon|bracket|whitespace|format|"
+    r"indent|spelling|log statement|print statement)\b",
     re.IGNORECASE,
 )
 
@@ -198,7 +241,23 @@ def _score_message(message: str, history: List[dict]) -> int:
     tool_msgs = sum(1 for m in history[-6:] if m.get("role") == "tool")
     score += min(15, tool_msgs * 5)
 
-    return min(100, score)
+    # ── Trivial scope reduction ────────────────────────────────────────────
+    # If the message contains "just", "only", "one", "quick" etc.,
+    # the task is small even if keywords are present.
+    if _TRIVIAL_SCOPE.search(msg):
+        score -= 15
+
+    # Micro-tasks: typo, rename, comment, format, spelling → always cheap
+    if _MICRO_TASKS.search(msg):
+        score -= 20
+
+    # Short message with a keyword but no context = probably trivial
+    # "refactor this" (14 chars) shouldn't score the same as a 500-char
+    # refactor plan even though both have "refactor"
+    if hits > 0 and length < 60:
+        score -= 10  # keyword present but message is too short to be serious
+
+    return max(0, min(100, score))
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +265,18 @@ def _score_message(message: str, history: List[dict]) -> int:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_TIERS = ModelTiers()
+
+_TIER_OVERRIDE = re.compile(r"^\s*/t([0-3])\b", re.IGNORECASE)
+
+
+def _parse_tier_override(message: str) -> Optional[int]:
+    """Check if the message starts with /t0, /t1, /t2, or /t3.
+    Returns the tier number (0-3) or None.
+    """
+    m = _TIER_OVERRIDE.match(message or "")
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def route_call(
@@ -224,9 +295,21 @@ def route_call(
     tree's semantic complexity floor is merged with the session floor —
     giving a floor that reflects what files you've been touching, not just
     the last message score.
+
+    Manual override: prefix the message with /t0, /t1, /t2, or /t3 to
+    force a specific tier for this call (bypasses all scoring).
     """
     tiers = tiers or _DEFAULT_TIERS
     history = history or []
+
+    # ── Manual override ────────────────────────────────────────────────────
+    # /t0 /t1 /t2 /t3 — force tier for this one call
+    msg = message or ""
+    override = _parse_tier_override(msg)
+    if override is not None:
+        model = [tiers.tier0, tiers.tier1, tiers.tier2, tiers.tier3][override]
+        logger.debug("model_router: MANUAL OVERRIDE → tier %d → %s", override, model)
+        return model
 
     # Get or create session state
     session: RouterSession = getattr(agent, "_router_session", None)
@@ -234,11 +317,26 @@ def route_call(
         session = RouterSession()
         agent._router_session = session
 
+    # Load persisted feedback on first call
+    if not session.feedback and session.turns == 0:
+        try:
+            persisted = load_feedback()
+            if persisted:
+                session.feedback = persisted
+        except Exception:
+            pass
+
     # Score the message
     turn_score = _score_message(message, history)
 
     # Apply session complexity floor
     effective_score = max(turn_score, session.complexity_floor)
+
+    # Apply feedback floor (if this call_type failed before, boost the floor)
+    feedback_boost = session.feedback_floor(call_type.value)
+    if feedback_boost > 0:
+        effective_score = max(effective_score, turn_score + feedback_boost)
+        effective_score = min(100, effective_score)
 
     # Boost floor from context tree if available
     ctx_floor_val = 0
@@ -262,10 +360,10 @@ def route_call(
     model = tiers.for_score(final_score)
 
     logger.debug(
-        "model_router: call_type=%s msg_score=%d floor=%d ctx_floor=%d "
+        "model_router: call_type=%s msg_score=%d floor=%d feedback=%d ctx_floor=%d "
         "effective=%d final=%d → %s",
         call_type.value, turn_score, session.complexity_floor,
-        ctx_floor_val, effective_score, final_score, model,
+        feedback_boost, ctx_floor_val, effective_score, final_score, model,
     )
 
     return model
@@ -307,3 +405,69 @@ def update_session_after_turn(
     if session is None:
         return
     session.update(turn_score, tools_used or [], files_written)
+
+
+def record_call_result(
+    agent: Any,
+    call_type: str,
+    success: bool,
+):
+    """Record whether a routed call succeeded or failed.
+
+    Call this after the LLM response is processed. If the model produced
+    a good result (no errors, user didn't retry), call with success=True.
+    If the model failed (hallucinated, wrong code, user retried), call
+    with success=False. The router will boost the floor for that call_type
+    so future calls of the same type route to a higher tier.
+
+    Example:
+        from agent.model_router import record_call_result
+        record_call_result(agent, "codegen", success=True)
+        record_call_result(agent, "analyze", success=False)
+    """
+    session: RouterSession = getattr(agent, "_router_session", None)
+    if session is None:
+        return
+    session.record_result(call_type, success)
+
+
+# ── Feedback persistence ──────────────────────────────────────────────────────
+
+_FEEDBACK_FILE = Path.home() / ".hermes" / "router-logs" / "feedback.json"
+
+
+def save_feedback(agent: Any) -> None:
+    """Persist feedback data so it survives across sessions."""
+    session: RouterSession = getattr(agent, "_router_session", None)
+    if session is None or not session.feedback:
+        return
+    try:
+        import json
+        _FEEDBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if _FEEDBACK_FILE.exists():
+            existing = json.loads(_FEEDBACK_FILE.read_text())
+        for ct, entry in session.feedback.items():
+            if ct in existing:
+                existing[ct]["fails"] += entry["fails"]
+                existing[ct]["total"] += entry["total"]
+                existing[ct]["floor_boost"] = max(
+                    existing[ct].get("floor_boost", 0),
+                    entry.get("floor_boost", 0),
+                )
+            else:
+                existing[ct] = entry
+        _FEEDBACK_FILE.write_text(json.dumps(existing, indent=2))
+    except Exception:
+        pass
+
+
+def load_feedback() -> dict[str, dict]:
+    """Load persisted feedback data."""
+    try:
+        import json
+        if _FEEDBACK_FILE.exists():
+            return json.loads(_FEEDBACK_FILE.read_text())
+    except Exception:
+        pass
+    return {}

@@ -1,0 +1,16 @@
+{
+  "_comment": "Custom tag patterns for the context tree. Add your own domains here.",
+  "_format": "Each entry: 'tag_name': ['regex1', 'regex2', ...] — matched case-insensitively",
+  "auth": ["auth", "login", "token", "password", "jwt", "session", "oauth"],
+  "security": ["secur", "crypto", "encrypt", "hash", "cert", "tls", "ssl"],
+  "database": ["db", "database", "sql", "migration", "schema", "model", "orm"],
+  "api": ["api", "endpoint", "route", "router", "rest", "graphql"],
+  "test": ["test", "spec", "fixture", "mock", "assert"],
+  "config": ["config", "settings", "env", "\\.yaml", "\\.toml", "\\.ini"],
+  "ui": ["component", "page", "view", "tsx", "jsx", "widget", "ui"],
+  "infra": ["deploy", "docker", "ci", "cd", "k8s", "helm", "infra"],
+  "ml": ["model", "training", "inference", "dataset", "neural", "transformer", "embedding", "fine.tun"],
+  "graphics": ["shader", "opengl", "vulkan", "render", "mesh", "texture", "gpu", "canvas"],
+  "networking": ["socket", "tcp", "udp", "http", "websocket", "network", "proxy", "dns"],
+  "game": ["game", "engine", "physics", "collision", "sprite", "scene", "entity"]
+}

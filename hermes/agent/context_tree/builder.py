@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import json
+from pathlib import Path
 from typing import Any, List
 
 try:
@@ -18,23 +20,60 @@ except ImportError:
         MODIFIED_BY, REFERENCED, TRIGGERED,
     )
 
-# ── Tag extraction ────────────────────────────────────────────────────────────
+# ── Tag patterns (loaded from tags.json, user-extensible) ─────────────────────
 
-_TAG_PATTERNS = [
-    (re.compile(r"auth|login|token|password|jwt|session|oauth", re.I), "auth"),
-    (re.compile(r"secur|crypto|encrypt|hash|cert|tls|ssl",     re.I), "security"),
-    (re.compile(r"db|database|sql|migration|schema|model|orm", re.I), "database"),
-    (re.compile(r"api|endpoint|route|router|rest|graphql",     re.I), "api"),
-    (re.compile(r"test|spec|fixture|mock|assert",              re.I), "test"),
-    (re.compile(r"config|settings|env|\.yaml|\.toml|\.ini",   re.I), "config"),
-    (re.compile(r"component|page|view|tsx|jsx|widget|ui",      re.I), "ui"),
-    (re.compile(r"deploy|docker|ci|cd|k8s|helm|infra",         re.I), "infra"),
-    (re.compile(r"import |from .* import|require\(",           re.I), "multi_file"),
-]
+_TAGS_FILE = Path(__file__).parent / "tags.json"
+_TAG_PATTERNS: list[tuple[re.Pattern, str]] | None = None
+
+
+def _load_tag_patterns() -> list[tuple[re.Pattern, str]]:
+    """Load tag patterns from tags.json. Falls back to hardcoded defaults."""
+    global _TAG_PATTERNS
+    if _TAG_PATTERNS is not None:
+        return _TAG_PATTERNS
+
+    patterns: list[tuple[re.Pattern, str]] = []
+    try:
+        if _TAGS_FILE.exists():
+            data = json.loads(_TAGS_FILE.read_text())
+            for tag, regexes in data.items():
+                if tag.startswith("_"):
+                    continue  # skip _comment, _format etc.
+                if isinstance(regexes, list):
+                    for rx in regexes:
+                        patterns.append((re.compile(rx, re.I), tag))
+    except Exception:
+        pass
+
+    if not patterns:
+        # Hardcoded fallback (same as v1.0)
+        defaults = [
+            (r"auth|login|token|password|jwt|session|oauth", "auth"),
+            (r"secur|crypto|encrypt|hash|cert|tls|ssl", "security"),
+            (r"db|database|sql|migration|schema|model|orm", "database"),
+            (r"api|endpoint|route|router|rest|graphql", "api"),
+            (r"test|spec|fixture|mock|assert", "test"),
+            (r"config|settings|env|\.yaml|\.toml|\.ini", "config"),
+            (r"component|page|view|tsx|jsx|widget|ui", "ui"),
+            (r"deploy|docker|ci|cd|k8s|helm|infra", "infra"),
+        ]
+        for rx, tag in defaults:
+            patterns.append((re.compile(rx, re.I), tag))
+
+    _TAG_PATTERNS = patterns
+    return patterns
+
+
+def reload_tags() -> None:
+    """Force reload of tag patterns from tags.json. Call after editing the file."""
+    global _TAG_PATTERNS
+    _TAG_PATTERNS = None
+    _load_tag_patterns()
 
 
 def _extract_tags(text: str) -> List[str]:
-    return list({tag for pattern, tag in _TAG_PATTERNS if pattern.search(text)})
+    patterns = _load_tag_patterns()
+    return list({tag for pattern, tag in patterns if pattern.search(text)})
 
 
 def _estimate_complexity(content: str) -> int:
