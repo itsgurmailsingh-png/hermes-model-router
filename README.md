@@ -1,11 +1,11 @@
 # hermes-model-router
 
-> Complexity-based model routing for Hermes Agent and Claude Code. Routes ALL LLM calls to the cheapest model tier that can handle the task — saving 60–75% on inference costs. A semantic context tree prevents mid-session downgrades.
+> Complexity-based model routing for Hermes Agent and Claude Code. Routes ALL LLM calls to the cheapest model tier that can handle the task — saving 30–45% on Claude API costs and significant latency on local Ollama calls. A semantic context tree prevents mid-session downgrades.
 
 ## What it does
 
-- **Hermes**: Hooks into `pre_llm_call` — **ALL** calls (main chat, sub-agents, title gen, memory review, tool loops) are routed to the cheapest capable tier. A context tree tracks files read/written, tool calls, and turn history to compute a semantic complexity floor that prevents mid-session downgrades.
-- **Claude Code**: A `PreToolUse` hook intercepts every Agent spawn and rewrites the `model` field based on task complexity before execution. Reads the Hermes context graph for cross-runtime floor sharing. **Note**: Claude Code's main chat model is NOT controllable via hooks — only sub-agent spawns can be routed. Hermes has no such limitation.
+- **Hermes**: Hooks into `pre_llm_call` — **ALL** calls (main chat, sub-agents, title gen, memory review, tool loops) are routed to the cheapest capable tier. A context tree tracks files read/written, tool calls, and turn history to compute a semantic complexity floor that prevents mid-session downgrades. Busy/overloaded models are detected and automatically retried with a fallback from a per-model chain.
+- **Claude Code**: A reverse proxy (`scripts/claude_proxy.py`) intercepts every `/v1/messages` call at the network layer and rewrites the `model` field before it reaches Anthropic. `ANTHROPIC_BASE_URL=http://localhost:8082` is set in `~/.claude/settings.json` so all calls route through it automatically. The proxy is auto-started by a `SessionStart` hook. A `PostToolUse` hook builds the context graph from every tool call in real time.
 
 ## Model Tiers
 
@@ -26,27 +26,38 @@
 
 ## How Routing Works
 
-### Scoring (0–100)
-Each call is scored before routing:
+### Scoring — 4-Dimensional Complexity Matrix
+
+Each call is scored across four independent dimensions (0–100 each), then combined into a weighted score:
+
+| Dimension | Weight | What it measures |
+|-----------|--------|-----------------|
+| **Text** | 40% | Keyword signals, message length, question count |
+| **Code** | 30% | Fenced blocks, file references, multi-file scope |
+| **Vision** | 20% | Image attachments or image-related keywords |
+| **Context** | 10% | Conversation depth, tool call history, floor boosts |
+
+**Combined score** = `text×0.4 + code×0.3 + vision×0.2 + context×0.1`
+
+#### Text dimension signals
 - Base: 30
 - Message length bonus: up to +20
-- High-signal keywords (refactor, architect, implement, debug...): +8 each, max +30
-- Code block in prompt: +15
-- Multi-file task: +15
-- **Trivial scope detection** (v1.2): message contains "just", "only", "one", "quick", "simple", "small" → -15. Signals a small task that doesn't need a big model.
-- **Micro-task detection** (v1.2): message contains "typo", "rename", "comment", "format", "indent", "spelling" → -20. Signals a mechanical edit that any tier can handle.
-- **Short+keyword penalty** (v1.2): a high-signal keyword is present but the message is < 60 chars → -10. Short messages with one keyword rarely need a big model.
-- Session complexity floor: never routes below the floor mid-session
-- **Context tree floor**: semantic floor from files you've been touching — prevents downgrade even when the message itself is simple
+- High-signal keywords (refactor, architect, implement, debug, migrate, design, optimize, api, schema, algorithm, end-to-end...): +8 each, max +30
+- Code block in prompt: +15 (code dimension)
+- Multi-file task: +15 (code dimension)
+- **Trivial scope** ("just", "only", "one", "quick", "simple", "small"): −15
+- **Micro-task** ("typo", "rename", "comment", "format", "indent", "spelling"): −20
+- **Short+keyword penalty**: keyword present but message < 60 chars → −10
 
-#### Scoring examples (v1.2)
+#### Priority routing (overrides combined score)
+1. **Vision ≥ 100** (image attached) → Sonnet (simple image) or Opus (text-heavy image)
+2. **Code ≥ 50** (multi-file, entire codebase) → Opus
+3. **Code > 25 and code ≥ text×0.5** → Sonnet minimum
+4. **Text ≥ 55** (3+ high-signal keywords) → Sonnet; text ≥ 75 → Opus
+5. **Context ≥ 30** (deep tool loop) → Sonnet minimum
+6. Combined score thresholds (below)
 
-| Message | v1.1 score | v1.2 score | Note |
-|---------|-----------|-----------|------|
-| "refactor this one variable" | 38 | 23 | "refactor" keyword (+8) but "one" triggers trivial scope (-15) |
-| "just rename this" | 20 | 5 | "just" triggers trivial scope (-15) and "rename" triggers micro-task (-20) |
-
-### Tier boundaries (actual code)
+### Tier boundaries
 | Score | Tier | Ollama | Claude |
 |-------|------|--------|--------|
 | ≤ 20 | 0 | ministral-3:3b | haiku |
@@ -89,11 +100,16 @@ Files not touched recently contribute less to the context floor:
 
 This prevents stale files from inflating the floor long after you've moved on.
 
-### Feedback loop (v1.2)
+### Feedback loop (fully automatic)
 
-After each routed call, the router tracks success/failure. Failures boost the floor (+10 each, capped at +30). Successes decay it (-3). Feedback persists to `~/.hermes/router-logs/feedback.json` and is loaded on session start.
+After every routed call, the router automatically records success or failure — no manual API calls needed:
 
-API: `record_call_result(agent, call_type, success)`, `save_feedback(agent)`, `load_feedback()`.
+- **Success** (`on_post_llm_call`): `record_result(call_type, success=True)` → floor boost decays by 3
+- **Failure** (`on_llm_error`): `record_result(call_type, success=False)` → floor boost grows by +10 (capped at +30)
+- Feedback is **immediately persisted** to `~/.hermes/router-logs/feedback.json` after every call
+- Loaded on session start so the router learns across sessions
+
+This means: if Haiku keeps failing on `codegen` calls, the router automatically escalates to Sonnet for those call types until success rate recovers.
 
 ### Manual override (v1.2)
 
@@ -107,14 +123,36 @@ Prefix a message with `/t0`, `/t1`, `/t2`, or `/t3` to force a specific tier for
 
 ## Plugin Hooks
 
+### Hermes plugin hooks
+
 | Hook | When | What it does |
 |------|------|-------------|
 | `on_session_start` | Session begins | Creates ContextGraph + ContextTreeBuilder, attaches to agent |
-| `pre_llm_call` | Before every LLM call | Scores message, applies floors, routes to tier |
-| `post_llm_call` | After each main turn | Updates session complexity floor |
+| `pre_llm_call` | Before every LLM call | Scores message (4D matrix), checks busy state, applies floors, routes to tier |
+| `post_llm_call` | After each main turn | Updates session floor + records success in feedback loop |
+| `on_llm_error` | On API error | Records failure in feedback loop; if busy/503, marks model busy and returns fallback |
 | `on_tool_result` | After every tool call | Feeds tool result to context tree builder |
 | `on_turn_start` | User sends message | Adds TURN node to graph |
 | `on_turn_end` | Turn completes | Saves graph to `~/.hermes/router-logs/context-graph.json` |
+
+### Claude Code hooks (in `~/.claude/settings.json`)
+
+| Hook | Trigger | What it does |
+|------|---------|-------------|
+| `SessionStart` | Claude Code starts | Auto-starts proxy if not running (`pgrep` guard) |
+| `UserPromptSubmit` | User sends message | Adds TURN node to context graph (async) |
+| `PostToolUse` | After any tool | Adds FILE/BASH/DELEGATE node to graph (async) |
+| `PreToolUse: Agent` | Before spawning sub-agent | Routes sub-agent to correct model tier |
+
+### Busy model fallback
+
+When a model returns 429, 503, 529, 502, or 504 (or a message containing "busy", "overloaded", "rate limit", "capacity"):
+
+1. Model is marked busy for 120 seconds (persisted to `~/.hermes/router-logs/busy-models.json`)
+2. Router walks the fallback chain for that model and returns `{"model": fallback, "retry": True}`
+3. Hermes retries the call immediately with the fallback — user sees no error
+
+Fallback chains are defined in `_OLLAMA_FALLBACK` and `_CLAUDE_FALLBACK` in the plugin.
 
 ## Installation
 
@@ -152,8 +190,34 @@ cp claude-code/helpers/router-analyze.mjs ~/.claude/helpers/
 mkdir -p ~/.claude/skills/model-router
 cp claude-code/skills/model-router/SKILL.md ~/.claude/skills/model-router/
 
-# 3. Add hook to ~/.claude/settings.json
-# In the "PreToolUse" array, add:
+# 3. Add to ~/.claude/settings.json:
+#    (a) env section — route all calls through the proxy
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8082"
+  }
+}
+
+#    (b) SessionStart hook — auto-start proxy
+{
+  "type": "command",
+  "command": "sh -c 'pgrep -f claude_proxy.py >/dev/null || python3 /path/to/scripts/claude_proxy.py &'",
+  "timeout": 3000,
+  "async": true
+}
+
+#    (c) PostToolUse hook — build context graph from every tool call
+{
+  "matcher": "Read|Write|Edit|MultiEdit|Bash|Glob|Grep|Agent|Task",
+  "hooks": [{
+    "type": "command",
+    "command": "python3 /path/to/scripts/build_graph.py",
+    "timeout": 5000,
+    "async": true
+  }]
+}
+
+#    (d) PreToolUse hook — route sub-agent spawns
 {
   "matcher": "Agent",
   "hooks": [{
@@ -164,7 +228,7 @@ cp claude-code/skills/model-router/SKILL.md ~/.claude/skills/model-router/
 }
 ```
 
-The Claude Code hook reads `~/.hermes/router-logs/context-graph.json` (written by the Hermes plugin) for cross-runtime context tree floor sharing.
+The proxy listens on `http://localhost:8082`, intercepts `/v1/messages`, scores the prompt using the same 4D matrix, rewrites the `model` field, and forwards to Anthropic. All routing decisions are logged to `~/.claude/router-logs/routing.jsonl`.
 
 ## Environment Variables
 
@@ -264,6 +328,7 @@ Feedback recorded (v1.2)
 - ✅ Internal calls (title gen, memory review, tool loops) — routed via `pre_llm_call`
 - ✅ All other turn types
 
-### Claude Code (partial control)
-- ✅ Sub-agent spawns (Agent tool) — routed via `PreToolUse` hook
-- ❌ Main chat model — set by Claude Code internally before any hook runs, not controllable via hooks. Would need a reverse proxy to intercept at the network layer.
+### Claude Code (full control via proxy)
+- ✅ **Main chat model** — intercepted at network layer by `claude_proxy.py`. `ANTHROPIC_BASE_URL=http://localhost:8082` redirects all calls through the proxy, which rewrites the model before forwarding to Anthropic.
+- ✅ Sub-agent spawns (Agent tool) — also routed via `PreToolUse` hook (`agent-router.mjs`)
+- ✅ Context graph — built automatically via `PostToolUse` + `UserPromptSubmit` hooks (`build_graph.py`)
