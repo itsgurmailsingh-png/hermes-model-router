@@ -134,6 +134,37 @@ _LOG_DIR  = Path.home() / ".hermes" / "router-logs"
 _LOG_FILE = _LOG_DIR / "routing.jsonl"
 
 
+_FEEDBACK_FILE = Path.home() / ".hermes" / "router-logs" / "feedback.json"
+
+
+def _save_feedback(session: Any) -> None:
+    """Persist feedback data from a RouterSession to disk."""
+    feedback = getattr(session, "feedback", None)
+    if not feedback:
+        return
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        existing: dict = {}
+        if _FEEDBACK_FILE.exists():
+            existing = json.loads(_FEEDBACK_FILE.read_text())
+        for ct, entry in feedback.items():
+            if ct in existing:
+                existing[ct]["fails"] = existing[ct].get("fails", 0) + entry.get("fails", 0)
+                existing[ct]["total"] = existing[ct].get("total", 0) + entry.get("total", 0)
+                existing[ct]["floor_boost"] = max(
+                    existing[ct].get("floor_boost", 0),
+                    entry.get("floor_boost", 0),
+                )
+            else:
+                existing[ct] = dict(entry)
+        _FEEDBACK_FILE.write_text(json.dumps(existing, indent=2))
+        # Reset session feedback counts to avoid double-counting next call
+        for ct in feedback:
+            feedback[ct] = {"fails": 0, "total": 0, "floor_boost": feedback[ct].get("floor_boost", 0)}
+    except Exception:
+        pass
+
+
 def _log_decision(entry: dict) -> None:
     try:
         _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -482,9 +513,11 @@ def on_post_llm_call(
     turn_type: str = "user",
     user_message: Any = None,
     conversation_history: Any = None,
+    assistant_response: Any = None,
+    call_type: str = "",
     **_: Any,
 ) -> None:
-    """Update session complexity floor after each main turn."""
+    """Update session complexity floor and record feedback after each main turn."""
     if turn_type in _INTERNAL_TURN_TYPES:
         return
     if not session_id:
@@ -497,6 +530,15 @@ def on_post_llm_call(
             from hermes.agent.model_router import _score_message
         score = _score_message(str(user_message or ""), list(conversation_history or []))
         session.update(score, [], 0)
+    except Exception:
+        pass
+
+    # ── Feedback loop: record success ─────────────────────────────────────────
+    try:
+        ct = call_type or "plan"
+        success = bool(assistant_response)
+        session.record_result(ct, success)
+        _save_feedback(session)
     except Exception:
         pass
 
@@ -557,6 +599,7 @@ def on_llm_error(
     model: str = "",
     error: Any = None,
     turn_type: str = "user",
+    call_type: str = "",
     **_: Any,
 ) -> Optional[dict]:
     """Called when an LLM API call fails.
@@ -567,6 +610,16 @@ def on_llm_error(
     """
     if not error:
         return None
+
+    # ── Feedback loop: record failure ─────────────────────────────────────────
+    if session_id:
+        try:
+            session = _get_session(session_id)
+            session.record_result(call_type or "plan", success=False)
+            _save_feedback(session)
+        except Exception:
+            pass
+
     if not _is_busy_error(error):
         return None  # not a busy error — don't interfere
 
