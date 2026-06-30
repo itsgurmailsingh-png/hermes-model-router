@@ -1,0 +1,1041 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermes Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f1117;
+    --bg2: #161b27;
+    --bg3: #1e2535;
+    --border: #2a3245;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --blue: #3b82f6;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --orange: #f97316;
+    --red: #ef4444;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, sans-serif;
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* ── Graph Panel ── */
+  #graph-panel {
+    width: 45%;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  #graph-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  #graph-header h2 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .stat-chips {
+    display: flex;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  .stat-chip {
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 2px 8px;
+    font-family: monospace;
+  }
+
+  .stat-chip span {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  #canvas-wrap {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  #graph-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: default;
+  }
+
+  #tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 11px;
+    max-width: 220px;
+    display: none;
+    z-index: 10;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  }
+
+  #tooltip .tt-label {
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 4px;
+    font-family: monospace;
+    font-size: 12px;
+    word-break: break-all;
+  }
+
+  #tooltip .tt-type {
+    color: var(--muted);
+    font-size: 10px;
+    margin-bottom: 4px;
+  }
+
+  #tooltip .tt-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    margin-top: 4px;
+  }
+
+  .tag-pill {
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 10px;
+    font-family: monospace;
+    font-weight: 600;
+  }
+
+  .tag-ui      { background: #1d4ed8; color: #bfdbfe; }
+  .tag-networking { background: #0e7490; color: #a5f3fc; }
+  .tag-database { background: #7c3aed; color: #ddd6fe; }
+  .tag-infra   { background: #065f46; color: #a7f3d0; }
+  .tag-config  { background: #92400e; color: #fde68a; }
+  .tag-api     { background: #be185d; color: #fbcfe8; }
+  .tag-ml      { background: #1e3a5f; color: #93c5fd; }
+  .tag-test    { background: #374151; color: #d1d5db; }
+  .tag-auth    { background: #7f1d1d; color: #fca5a5; }
+
+  /* ── Routing Panel ── */
+  #routing-panel {
+    width: 55%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #routing-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    flex-shrink: 0;
+  }
+
+  #routing-header h2 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .stats-bar {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .stats-item {
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .stats-item strong {
+    color: var(--text);
+  }
+
+  .stats-item .pct {
+    color: var(--green);
+    font-weight: 600;
+  }
+
+  /* Tabs */
+  .tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    flex-shrink: 0;
+    padding: 0 16px;
+  }
+
+  .tab-btn {
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--muted);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    margin-bottom: -1px;
+    font-family: system-ui, sans-serif;
+  }
+
+  .tab-btn:hover { color: var(--text); }
+
+  .tab-btn.active {
+    color: var(--blue);
+    border-bottom-color: var(--blue);
+  }
+
+  .tab-content {
+    display: none;
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .tab-content.active { display: block; }
+
+  /* Scrollbar */
+  .tab-content::-webkit-scrollbar { width: 6px; }
+  .tab-content::-webkit-scrollbar-track { background: transparent; }
+  .tab-content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* Table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  thead {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bg3);
+  }
+
+  thead th {
+    padding: 8px 12px;
+    text-align: left;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+  }
+
+  tbody tr {
+    border-bottom: 1px solid rgba(42,50,69,0.5);
+    transition: background 0.1s;
+  }
+
+  tbody tr:hover { background: var(--bg3); }
+
+  tbody tr.routed {
+    border-left: 2px solid rgba(34, 197, 94, 0.4);
+  }
+
+  tbody tr.not-routed {
+    border-left: 2px solid transparent;
+  }
+
+  td {
+    padding: 7px 12px;
+    vertical-align: middle;
+  }
+
+  .td-time {
+    font-family: monospace;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+    width: 52px;
+  }
+
+  .td-arrow {
+    color: var(--green);
+    font-size: 14px;
+    width: 20px;
+    text-align: center;
+  }
+
+  .td-arrow.no-route {
+    color: var(--border);
+    font-size: 12px;
+  }
+
+  .model-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: monospace;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+
+  .badge-t0  { background: rgba(59,130,246,0.15); color: #93c5fd; border: 1px solid rgba(59,130,246,0.3); }
+  .badge-t1  { background: rgba(34,197,94,0.15);  color: #86efac; border: 1px solid rgba(34,197,94,0.3); }
+  .badge-t2  { background: rgba(234,179,8,0.15);  color: #fde047; border: 1px solid rgba(234,179,8,0.3); }
+  .badge-t3  { background: rgba(249,115,22,0.15); color: #fdba74; border: 1px solid rgba(249,115,22,0.3); }
+  .badge-opus { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
+  .badge-gray { background: rgba(100,116,139,0.15); color: #94a3b8; border: 1px solid rgba(100,116,139,0.3); }
+
+  .score-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 70px;
+  }
+
+  .score-bar-bg {
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .score-bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.3s;
+  }
+
+  .score-num {
+    font-family: monospace;
+    font-size: 10px;
+    color: var(--muted);
+    min-width: 22px;
+    text-align: right;
+  }
+
+  .prompt-cell {
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-size: 11px;
+    cursor: default;
+  }
+
+  .prompt-cell:hover { color: var(--text); }
+
+  /* Legend */
+  .legend {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg2);
+    flex-shrink: 0;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    color: var(--muted);
+  }
+
+  .legend-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .legend-sq {
+    width: 8px; height: 8px;
+    transform: rotate(45deg);
+    flex-shrink: 0;
+  }
+
+  /* Canvas legend */
+  .canvas-legend {
+    position: absolute;
+    bottom: 10px;
+    left: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    pointer-events: none;
+  }
+
+  .canvas-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    color: var(--muted);
+    background: rgba(15,17,23,0.8);
+    padding: 3px 7px;
+    border-radius: 4px;
+  }
+
+  .cl-circle {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .cl-diamond {
+    width: 8px; height: 8px;
+    transform: rotate(45deg);
+    flex-shrink: 0;
+  }
+
+  .session-badge {
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: monospace;
+    font-weight: 600;
+  }
+
+  .s1 { background: rgba(59,130,246,0.15); color: #93c5fd; border: 1px solid rgba(59,130,246,0.2); }
+  .s2 { background: rgba(34,197,94,0.15);  color: #86efac; border: 1px solid rgba(34,197,94,0.2); }
+</style>
+</head>
+<body>
+
+<!-- ══════════════ GRAPH PANEL ══════════════ -->
+<div id="graph-panel">
+  <div id="graph-header">
+    <h2>Context Graph</h2>
+    <div class="stat-chips">
+      <div class="stat-chip"><span>12</span> nodes</div>
+      <div class="stat-chip"><span>2</span> sessions</div>
+      <div class="stat-chip"><span>0</span> edges</div>
+      <span class="session-badge s1">52ab58cd</span>
+      <span class="session-badge s2">7faaea99</span>
+    </div>
+  </div>
+  <div id="canvas-wrap">
+    <canvas id="graph-canvas"></canvas>
+    <div id="tooltip">
+      <div class="tt-label" id="tt-label"></div>
+      <div class="tt-type" id="tt-type"></div>
+      <div class="tt-tags" id="tt-tags"></div>
+    </div>
+    <div class="canvas-legend">
+      <div class="canvas-legend-item"><div class="cl-circle" style="background:#3b82f6"></div>FILE node</div>
+      <div class="canvas-legend-item"><div class="cl-diamond" style="background:#f97316"></div>CALL node</div>
+      <div class="canvas-legend-item" style="font-size:9px; color: #475569;">Drag nodes · Hover for details</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ ROUTING PANEL ══════════════ -->
+<div id="routing-panel">
+  <div id="routing-header">
+    <h2>Model Routing Log</h2>
+    <div class="stats-bar" id="stats-bar-hermes">
+      <div class="stats-item"><strong>34</strong> calls</div>
+      <div class="stats-item"><strong>25</strong> routed <span class="pct">(73%)</span></div>
+      <div class="stats-item">glm-5.2 <strong>×14</strong></div>
+      <div class="stats-item">gemma3 <strong>×8</strong></div>
+      <div class="stats-item">devstral <strong>×7</strong></div>
+      <div class="stats-item">ministral <strong>×5</strong></div>
+    </div>
+    <div class="stats-bar" id="stats-bar-proxy" style="display:none">
+      <div class="stats-item"><strong>30</strong> calls</div>
+      <div class="stats-item"><strong>22</strong> routed <span class="pct">(73%)</span></div>
+      <div class="stats-item">haiku <strong>×9</strong></div>
+      <div class="stats-item">sonnet <strong>×12</strong></div>
+      <div class="stats-item">opus <strong>×8</strong></div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('hermes', this)">Hermes (29)</button>
+    <button class="tab-btn" onclick="switchTab('proxy', this)">Proxy (30)</button>
+  </div>
+
+  <div id="tab-hermes" class="tab-content active">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Was</th>
+          <th></th>
+          <th>Used</th>
+          <th>Score</th>
+          <th>Prompt</th>
+        </tr>
+      </thead>
+      <tbody id="hermes-body"></tbody>
+    </table>
+  </div>
+
+  <div id="tab-proxy" class="tab-content">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Was</th>
+          <th></th>
+          <th>Used</th>
+          <th>Score</th>
+          <th>Prompt</th>
+        </tr>
+      </thead>
+      <tbody id="proxy-body"></tbody>
+    </table>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>T0/Haiku</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>T1/Sonnet</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#eab308"></div>T2/Devstral</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f97316"></div>T3/GLM</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>Opus</div>
+    <div class="legend-item" style="margin-left:auto; color:#22c55e; font-size:10px;">▌ routed</div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════
+// DATA
+// ═══════════════════════════════════════════
+
+const NODES = [
+  {"id":"file:/home/itsgurmailsingh/Documents/Farm management/farm os/farm_mobile/lib/screens/log_screen.dart","type":"FILE","label":"log_screen.dart","tags":["ui","networking"],"cx":73,"session":"52ab58cd"},
+  {"id":"call:52ab58cd-0b7f-4065-9a58-1b4708b5eaf7:0:1","type":"CALL","label":"bash: wc -l ...","tags":[],"cx":0,"session":"52ab58cd"},
+  {"id":"call:52ab58cd-0b7f-4065-9a58-1b4708b5eaf7:0:2","type":"CALL","label":"bash: # Save credentials...","tags":["infra","config"],"cx":0,"session":"52ab58cd"},
+  {"id":"call:52ab58cd-0b7f-4065-9a58-1b4708b5eaf7:0:3","type":"CALL","label":"bash: cat ENDSQL (database)","tags":["database"],"cx":0,"session":"52ab58cd"},
+  {"id":"file:pubspec.yaml","type":"FILE","label":"pubspec.yaml","tags":["test","infra","config","networking"],"cx":0,"session":"52ab58cd"},
+  {"id":"file:farm_server.py","type":"FILE","label":"farm_server.py","tags":["ml","test","api","config","networking","database"],"cx":39,"session":"52ab58cd"},
+  {"id":"file:SUPABASE_SETUP.sql","type":"FILE","label":"SUPABASE_SETUP.sql","tags":["database","networking"],"cx":10,"session":"52ab58cd"},
+  {"id":"file:settings.json","type":"FILE","label":"settings.json","tags":["api","ui","config"],"cx":2,"session":"7faaea99"},
+  {"id":"file:model_router_claude.py","type":"FILE","label":"model_router_claude.py","tags":["api","auth","test","ml","database","infra"],"cx":17,"session":"7faaea99"},
+  {"id":"call:7faaea99:0:1","type":"CALL","label":"bash: python3 complexity test","tags":["test"],"cx":0,"session":"7faaea99"},
+  {"id":"call:7faaea99:0:2","type":"CALL","label":"bash: python3 router test","tags":["ml"],"cx":0,"session":"7faaea99"},
+  {"id":"call:7faaea99:0:5","type":"CALL","label":"bash: echo postToolUse test","tags":["auth","test"],"cx":0,"session":"7faaea99"}
+];
+
+const HERMES_DATA = [
+  {"ts":"2026-06-27T23:52:37","model_was":"glm-5.2","model_used":"gemma3:12b","routed":true,"score":null,"prompt":"fix the typo"},
+  {"ts":"2026-06-28T00:11:52","model_was":"glm-5.2","model_used":"devstral-small-2:24b","routed":true,"score":null,"prompt":"go buld teh claude code art"},
+  {"ts":"2026-06-28T00:16:23","model_was":"glm-5.2","model_used":"devstral-small-2:24b","routed":true,"score":null,"prompt":"anthroc api meanng thought the app calls were gettng rerouted"},
+  {"ts":"2026-06-28T00:16:23","model_was":"glm-5.2","model_used":"glm-5.2","routed":false,"score":null,"prompt":"Review the conversation above and update the skill library."},
+  {"ts":"2026-06-28T00:17:09","model_was":"glm-5.2","model_used":"glm-5.2","routed":false,"score":null,"prompt":"[The user attached an image: screenshot"},
+  {"ts":"2026-06-28T00:17:33","model_was":"glm-5.2","model_used":"glm-5.2","routed":false,"score":null,"prompt":"so the cron job faled"},
+  {"ts":"2026-06-28T00:18:57","model_was":"glm-5.2","model_used":"glm-5.2","routed":false,"score":null,"prompt":"all calls went to glm5.2 and no reroutng"},
+  {"ts":"2026-06-28T00:23:35","model_was":"glm-5.2","model_used":"gemma3:12b","routed":true,"score":null,"prompt":"so now s t rerotung"},
+  {"ts":"2026-06-28T00:25:08","model_was":"gemma3:12b","model_used":"glm-5.2","routed":true,"score":null,"prompt":"[The user attached an image: software screenshot"},
+  {"ts":"2026-06-28T00:25:52","model_was":"gemma3:12b","model_used":"glm-5.2","routed":true,"score":null,"prompt":"yeah but ts the same model ts not reoutng"},
+  {"ts":"2026-06-28T00:27:38","model_was":"gemma3:12b","model_used":"glm-5.2","routed":true,"prompt":"oay do we ahve th elog of model calls"},
+  {"ts":"2026-06-28T00:34:00","model_was":"gemma3:12b","model_used":"devstral-small-2:24b","routed":true,"score":null,"prompt":"how can an mage go to glm5.2 you fucer"},
+  {"ts":"2026-06-28T00:35:05","model_was":"gemma3:12b","model_used":"glm-5.2","routed":true,"score":null,"prompt":"bro the mage s better for the vson model rght?"},
+  {"ts":"2026-06-28T00:36:56","model_was":"gemma3:12b","model_used":"devstral-small-2:24b","routed":true,"score":null,"prompt":"glm5.2 s not a vson model and there are cheaer vson model oton bro"},
+  {"ts":"2026-06-28T00:38:50","model_was":"gemma3:12b","model_used":"devstral-small-2:24b","routed":true,"score":null,"prompt":"oay we need dmesnon matrx for comolexty"},
+  {"ts":"2026-06-28T00:41:23","model_was":"gemma3:12b","model_used":"devstral-small-2:24b","routed":true,"score":null,"prompt":"dd you buld dmesnon matrx wth more models"},
+  {"ts":"2026-06-28T00:50:34","model_was":"gemma3:12b","model_used":"glm-5.2","routed":true,"score":null,"prompt":"bro then route the matrx what are you watng for"},
+  {"ts":"2026-06-28T03:21:28","model_was":"glm-5.2","model_used":"glm-5.2","routed":false,"score":null,"prompt":"challeneg teh lan on mert and relaty and be harsh"},
+  {"ts":"2026-06-28T03:22:27","model_was":"gpt-5.4","model_used":"gemma3:12b","routed":true,"score":null,"prompt":"so"},
+  {"ts":"2026-06-28T03:30:03","model_was":"gemma3:12b","model_used":"gemma3:12b","routed":false,"score":null,"prompt":"so"},
+  {"ts":"2026-06-29T22:29:20","model_was":"glm-5.2","model_used":"gemma3:12b","routed":true,"score":20,"prompt":"Hey Hermes, tell me this, did we finish moral routing"},
+  {"ts":"2026-06-29T22:30:54","model_was":"gemma3:12b","model_used":"ministral-3:3b","routed":true,"score":16,"prompt":"why"},
+  {"ts":"2026-06-29T22:32:09","model_was":"ministral-3:3b","model_used":"ministral-3:3b","routed":false,"score":16,"prompt":"bro"},
+  {"ts":"2026-06-29T22:36:51","model_was":"ministral-3:3b","model_used":"ministral-3:3b","routed":false,"score":16,"prompt":"so"},
+  {"ts":"2026-06-29T22:38:47","model_was":"ministral-3:3b","model_used":"gemma3:12b","routed":true,"score":23,"prompt":"Hey Hermes, can you make me a schema or a graph"},
+  {"ts":"2026-06-29T22:40:02","model_was":"ministral-3:3b","model_used":"gemma3:12b","routed":true,"score":23,"prompt":"Hey Hermes, that's not a graphical representation"},
+  {"ts":"2026-06-29T22:43:01","model_was":"ministral-3:3b","model_used":"gemma3:12b","routed":true,"score":28,"prompt":"Okay Why don't you call a different LLM or model to generate"},
+  {"ts":"2026-06-29T22:44:08","model_was":"glm-4.7","model_used":"ministral-3:3b","routed":true,"score":15,"prompt":"Generate HTML for my model router, please."},
+  {"ts":"2026-06-29T22:59:51","model_was":"glm-4.7","model_used":"ministral-3:3b","routed":true,"score":17,"prompt":"Can you at least tell me where is this model router stored"}
+];
+
+const PROXY_DATA = [
+  {"ts":"2026-06-27T18:15:34","model_was":"?","model_used":"sonnet","routed":true,"score":66,"prompt":"refactor the entire auth system across 5 files"},
+  {"ts":"2026-06-27T18:15:34","model_was":"?","model_used":"haiku","routed":true,"score":20,"prompt":"search for where model is set"},
+  {"ts":"2026-06-27T18:15:34","model_was":"?","model_used":"sonnet","routed":true,"score":54,"prompt":"design the database schema"},
+  {"ts":"2026-06-27T18:15:34","model_was":"?","model_used":"haiku","routed":true,"score":0,"prompt":"summarize what changed"},
+  {"ts":"2026-06-27T18:15:34","model_was":"?","model_used":"haiku","routed":true,"score":10,"prompt":"write tests for the router"},
+  {"ts":"2026-06-27T18:17:44","model_was":"sonnet","model_used":"opus","routed":true,"score":100,"prompt":"Create a GitHub repository called hermes-model-router"},
+  {"ts":"2026-06-27T18:20:09","model_was":"opus","model_used":"sonnet","routed":true,"score":70,"prompt":"Build the context tree system for Hermes Agent"},
+  {"ts":"2026-06-27T21:07:05","model_was":"sonnet","model_used":"haiku","routed":true,"score":24,"prompt":"Explore the Flutter app"},
+  {"ts":"2026-06-27T22:26:46","model_was":"haiku","model_used":"haiku","routed":false,"score":40,"prompt":"Fetch and read the GitHub repository"},
+  {"ts":"2026-06-28T00:14:11","model_was":"claude-haiku-4-5-20251001","model_used":"claude-sonnet-4-6","routed":true,"score":47,"prompt":"refactor the entire authentication system to use JWT tokens"},
+  {"ts":"2026-06-28T00:14:19","model_was":"claude-opus-4-6","model_used":"claude-haiku-4-5-20251001","routed":true,"score":16,"prompt":"hi"},
+  {"ts":"2026-06-28T00:14:19","model_was":"claude-haiku-4-5-20251001","model_used":"claude-haiku-4-5-20251001","routed":false,"score":37,"prompt":"refactor the entire auth system to use JWT and OAuth2"},
+  {"ts":"2026-06-28T00:14:19","model_was":"claude-haiku-4-5-20251001","model_used":"claude-opus-4-6","routed":true,"score":-1,"prompt":"/t3 just a typo"},
+  {"ts":"2026-06-28T00:15:50","model_was":"claude-opus-4-6","model_used":"claude-haiku-4-5-20251001","routed":true,"score":16,"prompt":"hi"},
+  {"ts":"2026-06-28T00:15:50","model_was":"claude-haiku-4-5-20251001","model_used":"claude-sonnet-4-6","routed":true,"score":48,"prompt":"refactor the entire authentication system to use JWT tokens"},
+  {"ts":"2026-06-28T00:15:50","model_was":"claude-haiku-4-5-20251001","model_used":"claude-opus-4-6","routed":true,"score":-1,"prompt":"/t3 just a typo"},
+  {"ts":"2026-06-28T04:29:15","model_was":"sonnet","model_used":"sonnet","routed":false,"score":65,"prompt":"Write and run two ML training scripts for a farm in Hisar"},
+  {"ts":"2026-06-28T13:59:05","model_was":"sonnet","model_used":"opus","routed":true,"score":100,"prompt":"You need to merge Flutter screens in a farm management"},
+  {"ts":"2026-06-28T14:32:25","model_was":"sonnet","model_used":"sonnet","routed":false,"score":48,"prompt":"I need you to research and compile ML models"},
+  {"ts":"2026-06-28T14:45:25","model_was":"sonnet","model_used":"haiku","routed":true,"score":38,"prompt":"Research real production-quality ML models for a 19-acre farm"},
+  {"ts":"2026-06-28T17:23:43","model_was":"sonnet","model_used":"haiku","routed":true,"score":40,"prompt":"Install AquaCrop-OSPy and run a real crop water simulation"},
+  {"ts":"2026-06-28T17:23:52","model_was":"sonnet","model_used":"haiku","routed":true,"score":38,"prompt":"Download and prepare the ICRISAT India crop yield data"},
+  {"ts":"2026-06-28T17:24:00","model_was":"sonnet","model_used":"sonnet","routed":false,"score":50,"prompt":"Download crop disease datasets from Kaggle"},
+  {"ts":"2026-06-28T17:24:08","model_was":"sonnet","model_used":"sonnet","routed":false,"score":68,"prompt":"Implement two real scientific models on our farm data"},
+  {"ts":"2026-06-28T17:27:16","model_was":"opus","model_used":"opus","routed":false,"score":100,"prompt":"Build the Autonomous Crop Engine for Lohari Ragho Farm"},
+  {"ts":"2026-06-28T17:27:37","model_was":"sonnet","model_used":"sonnet","routed":false,"score":70,"prompt":"Build a Flutter screen that shows the crop lifecycle calendar"},
+  {"ts":"2026-06-28T17:42:28","model_was":"sonnet","model_used":"sonnet","routed":false,"score":70,"prompt":"Expand the farm mobile app with 3 new screens"},
+  {"ts":"2026-06-29T22:51:47","model_was":"sonnet","model_used":"opus","routed":true,"score":80,"prompt":"You are working on a Farm OS project"},
+  {"ts":"2026-06-29T23:09:01","model_was":"sonnet","model_used":"opus","routed":true,"score":80,"prompt":"You are building the core intelligence layer of a Farm OS"},
+  {"ts":"2026-06-29T23:25:00","model_was":"?","model_used":"sonnet","routed":true,"score":70,"prompt":"You are rebuilding the Farm OS mobile app from scratch"}
+];
+
+// ═══════════════════════════════════════════
+// MODEL BADGE UTILS
+// ═══════════════════════════════════════════
+
+function modelTier(m) {
+  if (!m || m === '?') return 'gray';
+  const l = m.toLowerCase();
+  if (l.includes('ministral') || l.includes('haiku')) return 't0';
+  if (l.includes('gemma') || l.includes('sonnet')) return 't1';
+  if (l.includes('devstral')) return 't2';
+  if (l.includes('glm') || l.includes('gpt')) return 't3';
+  if (l.includes('opus')) return 'opus';
+  return 'gray';
+}
+
+function modelShort(m) {
+  if (!m || m === '?') return '?';
+  const l = m.toLowerCase();
+  if (l.includes('ministral')) return 'ministral';
+  if (l.includes('haiku')) return 'haiku';
+  if (l.includes('gemma')) return 'gemma3';
+  if (l.includes('sonnet')) return 'sonnet';
+  if (l.includes('devstral')) return 'devstral';
+  if (l.includes('glm-4')) return 'glm-4.7';
+  if (l.includes('glm')) return 'glm-5.2';
+  if (l.includes('gpt')) return 'gpt-5.4';
+  if (l.includes('opus')) return 'opus';
+  return m.length > 12 ? m.slice(0, 10) + '…' : m;
+}
+
+function badgeHTML(m) {
+  const tier = modelTier(m);
+  const label = modelShort(m);
+  return `<span class="model-badge badge-${tier}" style="font-family:monospace">${label}</span>`;
+}
+
+function scoreBar(score) {
+  if (score === null || score === undefined) return '<span style="color:var(--border);font-size:10px;font-family:monospace">—</span>';
+  const pct = Math.max(0, Math.min(100, score));
+  const color = pct >= 70 ? '#ef4444' : pct >= 46 ? '#22c55e' : '#3b82f6';
+  return `<div class="score-wrap">
+    <div class="score-bar-bg"><div class="score-bar-fill" style="width:${pct}%;background:${color}"></div></div>
+    <div class="score-num">${score}</div>
+  </div>`;
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  const h = String(d.getHours()).padStart(2,'0');
+  const m = String(d.getMinutes()).padStart(2,'0');
+  return `${h}:${m}`;
+}
+
+function buildRows(data, tbodyId) {
+  const tbody = document.getElementById(tbodyId);
+  data.forEach(row => {
+    const tr = document.createElement('tr');
+    tr.className = row.routed ? 'routed' : 'not-routed';
+    const arrow = row.routed
+      ? `<span class="td-arrow">→</span>`
+      : `<span class="td-arrow no-route">—</span>`;
+    const promptFull = row.prompt || '';
+    const promptShort = promptFull.length > 45 ? promptFull.slice(0, 42) + '…' : promptFull;
+    tr.innerHTML = `
+      <td class="td-time">${fmtTime(row.ts)}</td>
+      <td>${badgeHTML(row.model_was)}</td>
+      <td style="padding:0 4px">${arrow}</td>
+      <td>${badgeHTML(row.model_used)}</td>
+      <td>${scoreBar(row.score)}</td>
+      <td class="prompt-cell" title="${promptFull.replace(/"/g,'&quot;')}">${promptShort}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+buildRows(HERMES_DATA, 'hermes-body');
+buildRows(PROXY_DATA, 'proxy-body');
+
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  document.getElementById('stats-bar-hermes').style.display = name === 'hermes' ? 'flex' : 'none';
+  document.getElementById('stats-bar-proxy').style.display  = name === 'proxy'  ? 'flex' : 'none';
+}
+
+// ═══════════════════════════════════════════
+// FORCE GRAPH
+// ═══════════════════════════════════════════
+
+(function() {
+  const canvas = document.getElementById('graph-canvas');
+  const ctx = canvas.getContext('2d');
+  const tooltip = document.getElementById('tooltip');
+  const ttLabel = document.getElementById('tt-label');
+  const ttType  = document.getElementById('tt-type');
+  const ttTags  = document.getElementById('tt-tags');
+  const wrap = document.getElementById('canvas-wrap');
+
+  const TAG_COLORS = {
+    ui: 'tag-ui', networking: 'tag-networking', database: 'tag-database',
+    infra: 'tag-infra', config: 'tag-config', api: 'tag-api',
+    ml: 'tag-ml', test: 'tag-test', auth: 'tag-auth'
+  };
+
+  // Resize canvas to fill wrapper
+  function resize() {
+    canvas.width  = wrap.clientWidth;
+    canvas.height = wrap.clientHeight;
+  }
+  resize();
+  window.addEventListener('resize', () => { resize(); });
+
+  // Build simulation nodes
+  const sim = NODES.map((n, i) => {
+    // Two clusters: session 52ab58cd → left, 7faaea99 → right
+    const cx = n.session === '52ab58cd'
+      ? canvas.width * 0.32
+      : canvas.width * 0.72;
+    const cy = canvas.height * 0.5;
+    const angle = (i / NODES.length) * Math.PI * 2;
+    const r = 80 + Math.random() * 60;
+    // FILE radius based on complexity
+    let radius = 12;
+    if (n.type === 'FILE') {
+      const cxVal = n.cx || 0;
+      radius = Math.max(12, Math.min(28, 12 + (cxVal / 80) * 16));
+    } else {
+      radius = 10;
+    }
+    return {
+      ...n,
+      x: cx + Math.cos(angle) * r,
+      y: cy + Math.sin(angle) * r,
+      vx: 0, vy: 0,
+      radius,
+      pinned: false
+    };
+  });
+
+  // Force simulation
+  const REPEL = 1800;
+  const GRAVITY = 0.015;
+  const DAMPING = 0.82;
+  const TICK = 16; // ~60fps
+
+  function tick() {
+    const W = canvas.width, H = canvas.height;
+    // Cluster centers
+    const clusterX = { '52ab58cd': W * 0.32, '7faaea99': W * 0.72 };
+    const clusterY = { '52ab58cd': H * 0.5,  '7faaea99': H * 0.5  };
+
+    for (let i = 0; i < sim.length; i++) {
+      if (sim[i].pinned) continue;
+      const a = sim[i];
+      let fx = 0, fy = 0;
+
+      // Repulsion
+      for (let j = 0; j < sim.length; j++) {
+        if (i === j) continue;
+        const b = sim[j];
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const dist2 = dx*dx + dy*dy + 0.01;
+        const force = REPEL / dist2;
+        fx += (dx / Math.sqrt(dist2)) * force;
+        fy += (dy / Math.sqrt(dist2)) * force;
+      }
+
+      // Gravity to cluster center
+      fx += (clusterX[a.session] - a.x) * GRAVITY;
+      fy += (clusterY[a.session] - a.y) * GRAVITY;
+
+      // Integrate
+      a.vx = (a.vx + fx) * DAMPING;
+      a.vy = (a.vy + fy) * DAMPING;
+      a.x += a.vx;
+      a.y += a.vy;
+
+      // Boundary
+      const pad = a.radius + 8;
+      if (a.x < pad) { a.x = pad; a.vx *= -0.5; }
+      if (a.x > W - pad) { a.x = W - pad; a.vx *= -0.5; }
+      if (a.y < pad) { a.y = pad; a.vy *= -0.5; }
+      if (a.y > H - pad) { a.y = H - pad; a.vy *= -0.5; }
+    }
+  }
+
+  function drawHexagon(x, y, r) {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI / 3) * i - Math.PI / 6;
+      const px = x + r * Math.cos(angle);
+      const py = y + r * Math.sin(angle);
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+  }
+
+  function drawDiamond(x, y, s) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - s);
+    ctx.lineTo(x + s, y);
+    ctx.lineTo(x, y + s);
+    ctx.lineTo(x - s, y);
+    ctx.closePath();
+  }
+
+  function drawLabel(n) {
+    ctx.save();
+    ctx.font = '10px monospace';
+    ctx.fillStyle = 'rgba(148,163,184,0.9)';
+    ctx.textAlign = 'center';
+    ctx.fillText(n.label, n.x, n.y + n.radius + 13);
+    ctx.restore();
+  }
+
+  // Session cluster label
+  function drawClusterLabels() {
+    const W = canvas.width, H = canvas.height;
+    ctx.save();
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = 'rgba(59,130,246,0.35)';
+    ctx.fillText('52ab58cd', W * 0.32, 22);
+    ctx.fillStyle = 'rgba(34,197,94,0.35)';
+    ctx.fillText('7faaea99', W * 0.72, 22);
+    ctx.restore();
+  }
+
+  let hoveredNode = null;
+
+  function draw() {
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    // Background grid (subtle)
+    ctx.save();
+    ctx.strokeStyle = 'rgba(42,50,69,0.3)';
+    ctx.lineWidth = 0.5;
+    for (let x = 0; x < W; x += 40) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let y = 0; y < H; y += 40) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    ctx.restore();
+
+    drawClusterLabels();
+
+    // Draw session halos
+    const sessions = ['52ab58cd', '7faaea99'];
+    sessions.forEach((s, si) => {
+      const nodes = sim.filter(n => n.session === s);
+      if (!nodes.length) return;
+      let cx = 0, cy = 0;
+      nodes.forEach(n => { cx += n.x; cy += n.y; });
+      cx /= nodes.length; cy /= nodes.length;
+      const col = si === 0 ? 'rgba(59,130,246,0.04)' : 'rgba(34,197,94,0.04)';
+      const bord = si === 0 ? 'rgba(59,130,246,0.12)' : 'rgba(34,197,94,0.12)';
+      ctx.beginPath();
+      ctx.arc(cx, cy, 120, 0, Math.PI * 2);
+      ctx.fillStyle = col;
+      ctx.fill();
+      ctx.strokeStyle = bord;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    });
+
+    // Draw nodes
+    sim.forEach(n => {
+      const isHovered = n === hoveredNode;
+      ctx.save();
+
+      if (n.type === 'FILE') {
+        // Glow for hovered
+        if (isHovered) {
+          ctx.shadowColor = '#3b82f6';
+          ctx.shadowBlur = 18;
+        }
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+        const grad = ctx.createRadialGradient(n.x - n.radius*0.3, n.y - n.radius*0.3, 0, n.x, n.y, n.radius);
+        grad.addColorStop(0, '#60a5fa');
+        grad.addColorStop(1, '#1d4ed8');
+        ctx.fillStyle = grad;
+        ctx.fill();
+        ctx.strokeStyle = isHovered ? '#93c5fd' : 'rgba(59,130,246,0.4)';
+        ctx.lineWidth = isHovered ? 2 : 1;
+        ctx.stroke();
+
+        // Complexity ring
+        if (n.cx > 0) {
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.radius + 3, -Math.PI/2, -Math.PI/2 + (n.cx/100)*Math.PI*2);
+          ctx.strokeStyle = 'rgba(96,165,250,0.5)';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      } else if (n.type === 'CALL') {
+        if (isHovered) {
+          ctx.shadowColor = '#f97316';
+          ctx.shadowBlur = 14;
+        }
+        drawDiamond(n.x, n.y, 9);
+        const grad = ctx.createRadialGradient(n.x, n.y - 3, 0, n.x, n.y, 10);
+        grad.addColorStop(0, '#fb923c');
+        grad.addColorStop(1, '#c2410c');
+        ctx.fillStyle = grad;
+        ctx.fill();
+        ctx.strokeStyle = isHovered ? '#fdba74' : 'rgba(249,115,22,0.4)';
+        ctx.lineWidth = isHovered ? 2 : 1;
+        ctx.stroke();
+      }
+
+      ctx.restore();
+
+      // Always draw label for FILE, only on hover for CALL
+      if (n.type === 'FILE' || isHovered) {
+        drawLabel(n);
+      }
+    });
+  }
+
+  let animFrame;
+  function loop() {
+    tick();
+    draw();
+    animFrame = requestAnimationFrame(loop);
+  }
+  loop();
+
+  // ── Mouse interaction ──
+  let dragging = null, dragOffX = 0, dragOffY = 0;
+
+  function getNode(mx, my) {
+    // Search in reverse so top-rendered nodes are hit first
+    for (let i = sim.length - 1; i >= 0; i--) {
+      const n = sim[i];
+      const dx = mx - n.x, dy = my - n.y;
+      const hitR = n.type === 'FILE' ? n.radius + 4 : 12;
+      if (dx*dx + dy*dy <= hitR*hitR) return n;
+    }
+    return null;
+  }
+
+  function canvasPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return [(e.clientX - rect.left) * scaleX, (e.clientY - rect.top) * scaleY];
+  }
+
+  canvas.addEventListener('mousedown', e => {
+    const [mx, my] = canvasPos(e);
+    const n = getNode(mx, my);
+    if (n) {
+      dragging = n;
+      dragOffX = mx - n.x;
+      dragOffY = my - n.y;
+      n.pinned = true;
+      n.vx = 0; n.vy = 0;
+      canvas.style.cursor = 'grabbing';
+    }
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    const [mx, my] = canvasPos(e);
+    if (dragging) {
+      dragging.x = mx - dragOffX;
+      dragging.y = my - dragOffY;
+      dragging.vx = 0; dragging.vy = 0;
+      return;
+    }
+
+    const n = getNode(mx, my);
+    hoveredNode = n;
+    canvas.style.cursor = n ? 'grab' : 'default';
+
+    if (n) {
+      ttLabel.textContent = n.label;
+      ttType.textContent = `${n.type}  ·  session ${n.session}  ·  cx ${n.cx}`;
+      ttTags.innerHTML = n.tags.length
+        ? n.tags.map(t => `<span class="tag-pill ${TAG_COLORS[t] || 'tag-test'}">${t}</span>`).join('')
+        : '<span style="color:#475569;font-size:9px">no tags</span>';
+
+      // Position tooltip
+      const rect = canvas.getBoundingClientRect();
+      const wrapRect = wrap.getBoundingClientRect();
+      let tx = e.clientX - wrapRect.left + 12;
+      let ty = e.clientY - wrapRect.top - 10;
+      if (tx + 230 > wrap.clientWidth) tx = e.clientX - wrapRect.left - 240;
+      tooltip.style.left = tx + 'px';
+      tooltip.style.top  = ty + 'px';
+      tooltip.style.display = 'block';
+    } else {
+      tooltip.style.display = 'none';
+    }
+  });
+
+  canvas.addEventListener('mouseup', () => {
+    if (dragging) {
+      dragging.pinned = false;
+      dragging = null;
+      canvas.style.cursor = 'default';
+    }
+  });
+
+  canvas.addEventListener('mouseleave', () => {
+    hoveredNode = null;
+    tooltip.style.display = 'none';
+    if (dragging) {
+      dragging.pinned = false;
+      dragging = null;
+    }
+  });
+})();
+</script>
+</body>
+</html>

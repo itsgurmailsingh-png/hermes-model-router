@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Model Router — How It Works</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e2e8f0;
+    --muted: #8892a4;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --orange: #f97316;
+    --red: #ef4444;
+    --blue: #3b82f6;
+    --purple: #a855f7;
+    --cyan: #06b6d4;
+    --pink: #ec4899;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    padding: 40px 20px;
+  }
+
+  h1 { font-size: 2rem; margin-bottom: 6px; }
+  h2 { font-size: 1.2rem; font-weight: 600; margin-bottom: 14px; color: var(--cyan); }
+  h3 { font-size: 1rem; font-weight: 600; margin-bottom: 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+
+  .subtitle { color: var(--muted); margin-bottom: 40px; font-size: 1rem; }
+
+  .grid { display: grid; gap: 20px; }
+  .grid-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .grid-3 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 24px;
+  }
+
+  .tag {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    letter-spacing: .04em;
+    margin-bottom: 10px;
+  }
+
+  .tag-works   { background: #14532d; color: var(--green); }
+  .tag-broken  { background: #450a0a; color: var(--red); }
+  .tag-partial { background: #431407; color: var(--orange); }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.78rem;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 600;
+    margin: 3px 2px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+  /* tier colours */
+  .t0 { background: #1e2430; border: 1px solid #3b82f6; color: var(--blue); }
+  .t1 { background: #1a2e1a; border: 1px solid #22c55e; color: var(--green); }
+  .t2 { background: #2e2a0a; border: 1px solid #eab308; color: var(--yellow); }
+  .t3 { background: #2d1a0a; border: 1px solid #f97316; color: var(--orange); }
+  .v  { background: #1e1a2e; border: 1px solid #a855f7; color: var(--purple); }
+  .c  { background: #1a2e2e; border: 1px solid #06b6d4; color: var(--cyan); }
+  .u  { background: #2e0a0a; border: 1px solid #ef4444; color: var(--red); }
+
+  .flow {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    flex-wrap: wrap;
+    margin-top: 6px;
+  }
+  .flow-step {
+    background: #1e2430;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 0.82rem;
+    white-space: nowrap;
+  }
+  .flow-arrow { color: var(--muted); padding: 0 6px; font-size: 1.1rem; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th { text-align: left; padding: 8px 12px; color: var(--muted); border-bottom: 1px solid var(--border); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .05em; }
+  td { padding: 8px 12px; border-bottom: 1px solid #1e2230; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1e2230; }
+
+  .score-bar-wrap { display: flex; align-items: center; gap: 8px; }
+  .score-bar { height: 8px; border-radius: 4px; flex-shrink: 0; }
+
+  code {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: 'Fira Code', monospace;
+    font-size: 0.82rem;
+    color: var(--cyan);
+  }
+
+  .check { color: var(--green); }
+  .cross { color: var(--red); }
+  .warn  { color: var(--orange); }
+
+  ul { padding-left: 18px; }
+  li { margin-bottom: 5px; }
+
+  .section { margin-bottom: 36px; }
+
+  .dim-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  @media (max-width: 700px) { .dim-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .dim-card {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    text-align: center;
+  }
+  .dim-pct { font-size: 1.6rem; font-weight: 700; margin: 6px 0 2px; }
+  .dim-label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .dim-name { font-size: 0.9rem; font-weight: 600; margin-bottom: 4px; }
+
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .pill-green { background: #14532d; color: var(--green); }
+  .pill-red   { background: #450a0a; color: var(--red); }
+  .pill-yellow{ background: #431407; color: var(--orange); }
+</style>
+</head>
+<body>
+
+<h1>Model Router</h1>
+<p class="subtitle">How every LLM call gets routed — what works, what's broken, and why.</p>
+
+<!-- ── WHAT IT IS ─────────────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>What it does</h2>
+  <div class="card">
+    <p>
+      Before every LLM call, the plugin intercepts it and scores the prompt across
+      <strong>4 dimensions</strong>. Based on that score it swaps the model to the cheapest
+      one that can handle the task — the user's selected model is the <em>ceiling</em>,
+      not the default.
+    </p>
+    <div class="flow" style="margin-top:16px">
+      <div class="flow-step">Prompt arrives</div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step">Score 4 dimensions</div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step">Apply call-type offset</div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step">Select model tier</div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step">Return <code>{"model": "…"}</code></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── DIMENSION MATRIX ──────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Step 1 — Score 4 dimensions (each 0–100)</h2>
+  <div class="dim-grid" style="margin-bottom:16px">
+    <div class="dim-card">
+      <div class="dim-name" style="color:var(--blue)">Text</div>
+      <div class="dim-pct" style="color:var(--blue)">40%</div>
+      <div class="dim-label">weight in combined</div>
+      <p style="font-size:0.78rem;color:var(--muted);margin-top:8px">Keywords like <em>refactor, architect, debug</em>. Message length. Question marks. Trivial scope deducts points.</p>
+    </div>
+    <div class="dim-card">
+      <div class="dim-name" style="color:var(--yellow)">Code</div>
+      <div class="dim-pct" style="color:var(--yellow)">30%</div>
+      <div class="dim-label">weight in combined</div>
+      <p style="font-size:0.78rem;color:var(--muted);margin-top:8px">Fenced code blocks, imports, class/function definitions, multi-file references (3+ files = heavy).</p>
+    </div>
+    <div class="dim-card">
+      <div class="dim-name" style="color:var(--purple)">Vision</div>
+      <div class="dim-pct" style="color:var(--purple)">20%</div>
+      <div class="dim-label">weight in combined</div>
+      <p style="font-size:0.78rem;color:var(--muted);margin-top:8px">Image attachments in message or history → 100. Text mentions image keyword → 50. None → 0.</p>
+    </div>
+    <div class="dim-card">
+      <div class="dim-name" style="color:var(--cyan)">Context</div>
+      <div class="dim-pct" style="color:var(--cyan)">10%</div>
+      <div class="dim-label">weight in combined</div>
+      <p style="font-size:0.78rem;color:var(--muted);margin-top:8px">Conversation depth (turns × 3). Tool results in recent history. Context-tree floor. Feedback floor.</p>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Combined formula</h3>
+    <code style="font-size:0.9rem">combined = text×0.4 + code×0.3 + vision×0.2 + context×0.1 + call_type_offset</code>
+  </div>
+</div>
+
+<!-- ── MODEL SELECTION ───────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Step 2 — Pick the model</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Priority</th><th>Condition</th><th>Model</th><th>Why</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>vision = 100 <em>and</em> text &gt; 50</td>
+          <td><span class="badge v"><span class="dot" style="background:var(--purple)"></span>gemma3:27b</span></td>
+          <td>Strong vision + complex text</td>
+        </tr>
+        <tr>
+          <td>1</td>
+          <td>vision = 100 <em>and</em> text 20–50</td>
+          <td><span class="badge v"><span class="dot" style="background:var(--purple)"></span>gemma3:12b</span></td>
+          <td>Mid vision</td>
+        </tr>
+        <tr>
+          <td>1</td>
+          <td>vision = 100 <em>and</em> text ≤ 20</td>
+          <td><span class="badge v"><span class="dot" style="background:var(--purple)"></span>gemma3:4b</span></td>
+          <td>Cheap vision (simple describe)</td>
+        </tr>
+        <tr>
+          <td>1</td>
+          <td>vision = 50 (keyword mention)</td>
+          <td><span class="badge v"><span class="dot" style="background:var(--purple)"></span>gemma3:12b</span></td>
+          <td>Mentions image but no attachment</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>code ≥ 50</td>
+          <td><span class="badge c"><span class="dot" style="background:var(--cyan)"></span>qwen3-coder:480b</span></td>
+          <td>Massive codebase / complex refactor</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>code &gt; 25 <em>and</em> code ≥ text×0.6</td>
+          <td><span class="badge c"><span class="dot" style="background:var(--cyan)"></span>devstral-small-2:24b</span></td>
+          <td>General coding (code dominates)</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>combined ≤ 20</td>
+          <td><span class="badge t0"><span class="dot" style="background:var(--blue)"></span>ministral-3:3b</span></td>
+          <td>Greetings, titles, trivial lookups</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>combined 21–45</td>
+          <td><span class="badge t1"><span class="dot" style="background:var(--green)"></span>gemma3:12b</span></td>
+          <td>Simple Q&A, summaries</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>combined 46–70</td>
+          <td><span class="badge t2"><span class="dot" style="background:var(--yellow)"></span>devstral-small-2:24b</span></td>
+          <td>Coding, analysis</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>combined &gt; 70</td>
+          <td><span class="badge t3"><span class="dot" style="background:var(--orange)"></span>glm-5.2</span></td>
+          <td>Planning, architecture, hard reasoning</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── CALL TYPE OFFSETS ──────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Call-type offsets (applied to combined score)</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>Turn type</th><th>Maps to call_type</th><th>Offset effect</th></tr></thead>
+      <tbody>
+        <tr><td>main user turn</td><td><code>plan</code></td><td>+0 (full score)</td></tr>
+        <tr><td><code>subagent</code></td><td><code>subagent</code></td><td>inherits full</td></tr>
+        <tr><td><code>tool</code> / <code>tool_result</code></td><td><code>analyze</code></td><td>slight downgrade</td></tr>
+        <tr><td><code>title</code> / <code>title_generation</code></td><td><code>title</code></td><td>heavy downgrade (−20 to −30)</td></tr>
+        <tr><td><code>memory</code> / <code>compression</code></td><td><code>summarize</code></td><td>heavy downgrade</td></tr>
+        <tr><td><code>background</code></td><td><code>verify</code></td><td>downgrade</td></tr>
+        <tr><td><code>skill</code> / <code>skills_hub</code></td><td><code>codegen</code></td><td>slight upgrade</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── WHAT WORKS ─────────────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>What works ✓</h2>
+  <div class="grid grid-2">
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>Multi-dimensional scoring</h3>
+      <p>Text, code, vision, and context are scored independently. Vision always wins priority 1, code wins priority 2 — this prevents a simple "hello + image" from hitting t0 when it needs a vision model.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>Code specialist bypass</h3>
+      <p>When code score ≥ 50, the router jumps straight to <code>qwen3-coder:480b</code> regardless of the combined text+context score. Massive refactors and multi-file tasks reliably get the code model.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>Session complexity floor</h3>
+      <p>A <code>RouterSession</code> object tracks the running max complexity. Once a session goes deep (architecture discussion), cheaper models aren't picked for follow-up turns even if they're short.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>Context tree floor</h3>
+      <p><code>ContextGraph</code> + <code>ContextTreeBuilder</code> record tool results each turn. The graph's <code>complexity_floor()</code> boosts the context dimension — mid-task tool loops stay on smarter models.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>Claude provider branch</h3>
+      <p>When the active model is a Claude model (Anthropic provider), a separate <code>ClaudeRouter</code> / <code>ClaudeTiers</code> path is taken — no accidental mixing of Ollama tiers into Claude calls.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>Kill switch &amp; skip types</h3>
+      <p><code>HERMES_MODEL_ROUTER=0</code> disables everything. <code>HERMES_ROUTER_SKIP_TYPES=title,memory</code> lets you pin specific turn types to the user's model instead of routing them.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>All tier overrides via env vars</h3>
+      <p>Every model slot (<code>HERMES_ROUTER_TIER0</code> … <code>HERMES_ROUTER_VISION3</code>, <code>HERMES_ROUTER_CODE2</code>) is overridable without touching code.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-works">WORKS</span>
+      <h3>Trivial-task detection</h3>
+      <p>"Hi", "thanks", "ok" patterns score 5 (t0 guaranteed). Phrases like "just rename", "fix typo", "add a comment" deduct 15–20 points — keeps tiny tasks on tiny models.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ── WHAT DOESN'T WORK ─────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>What doesn't work / known gaps ✗</h2>
+  <div class="grid grid-2">
+    <div class="card">
+      <span class="tag tag-broken">BROKEN</span>
+      <h3>Vision score weight is wrong</h3>
+      <p>Vision has 20% weight in <code>combined</code>, but vision routing happens <em>before</em> combined is computed (priority 1). The 20% weight never actually influences vision model selection — it's dead weight in the formula.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-broken">BROKEN</span>
+      <h3>Code score bypasses combined — even for small tasks</h3>
+      <p>If code ≥ 50, <code>qwen3-coder:480b</code> is picked regardless of context or text scores. A one-line fix with a code block can score code=50 (30 for ``` + 15 for an import = 45, 5 from a keyword) and over-route.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-broken">BROKEN</span>
+      <h3>Context tree init silently fails on ImportError</h3>
+      <p><code>on_session_start</code> catches all exceptions from <code>ContextGraph</code> / <code>ContextTreeBuilder</code> imports and logs at DEBUG. If the tree never initialises, <code>_ctx_builders[session_id]</code> stays empty and the context floor is always 0 — no warning to the user.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-broken">BROKEN</span>
+      <h3>Feedback floor is loaded only on turn 0</h3>
+      <p><code>load_feedback()</code> runs once when <code>session_obj.turns == 0</code>. If feedback is written mid-session it is never reloaded. The feedback floor is stale for the rest of the session.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-partial">PARTIAL</span>
+      <h3>Ultra models (deepseek-v3.1, mistral-large-3) are defined but never selected</h3>
+      <p>The docstring mentions <code>U1</code> and <code>U2</code> ultra models for the hardest tasks. They appear in the comment but are not in <code>MODELS</code> dict and <code>select_model()</code> never returns them. Dead code.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-partial">PARTIAL</span>
+      <h3>call_type_offset values are not documented here</h3>
+      <p><code>CALL_TYPE_OFFSET</code> is imported from <code>hermes.agent.model_router</code> but the actual numeric values aren't in <code>complexity_matrix.py</code>. The offset is applied to combined score, but you can't see the magnitude without reading a third file.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-partial">PARTIAL</span>
+      <h3>Session cap (32) silently evicts active sessions</h3>
+      <p><code>_clean_old_sessions(keep=32)</code> drops oldest sessions by insertion order. In long-running Hermes processes with many parallel sessions, a session's floor can be reset mid-conversation.</p>
+    </div>
+    <div class="card">
+      <span class="tag tag-partial">PARTIAL</span>
+      <h3>No ceiling enforcement</h3>
+      <p>The docstring says "user's selected model is the tier-3 ceiling." But if the user's model is t1, the router can still return t3 or c2. There's no guard that caps the routed model to whatever the user has selected.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ── EXAMPLE SCORING ────────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Example scorings</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Prompt</th><th>text</th><th>code</th><th>vision</th><th>ctx</th><th>combined</th><th>Model</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>"Hey, thanks!"</td>
+          <td>5</td><td>0</td><td>0</td><td>0</td>
+          <td>2</td>
+          <td><span class="badge t0">ministral-3:3b</span></td>
+        </tr>
+        <tr>
+          <td>"What is Python?"</td>
+          <td>32</td><td>0</td><td>0</td><td>0</td>
+          <td>13</td>
+          <td><span class="badge t0">ministral-3:3b</span></td>
+        </tr>
+        <tr>
+          <td>"Summarize this doc"</td>
+          <td>38</td><td>0</td><td>0</td><td>6</td>
+          <td>16</td>
+          <td><span class="badge t0">ministral-3:3b</span></td>
+        </tr>
+        <tr>
+          <td>"Explain why this function fails"</td>
+          <td>54</td><td>0</td><td>0</td><td>0</td>
+          <td>22</td>
+          <td><span class="badge t1">gemma3:12b</span></td>
+        </tr>
+        <tr>
+          <td>"Describe this screenshot" [image attached]</td>
+          <td>40</td><td>0</td><td>100</td><td>0</td>
+          <td>—</td>
+          <td><span class="badge v">gemma3:12b (vision)</span></td>
+        </tr>
+        <tr>
+          <td>"Implement auth middleware across 3 files"</td>
+          <td>70</td><td>55</td><td>0</td><td>0</td>
+          <td>—</td>
+          <td><span class="badge c">qwen3-coder:480b</span></td>
+        </tr>
+        <tr>
+          <td>"Architect the migration plan for this entire codebase"</td>
+          <td>86</td><td>20</td><td>0</td><td>12</td>
+          <td>42</td>
+          <td><span class="badge t1">gemma3:12b</span> ← under-routes!</td>
+        </tr>
+        <tr>
+          <td>"Refactor + debug + design schema + deploy pipeline" (deep session)</td>
+          <td>94</td><td>30</td><td>0</td><td>30</td>
+          <td>77</td>
+          <td><span class="badge t3">glm-5.2</span></td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="color:var(--muted);font-size:0.8rem;margin-top:10px">⚠ Row 7: "architect" + "migration" + "entire codebase" hits text=86 but combined is still 42 because code=20, ctx=12 are low. Under-routes to t1 instead of t3.</p>
+  </div>
+</div>
+
+<!-- ── ENV VARS ───────────────────────────────────────────────────────────── -->
+<div class="section">
+  <h2>Configuration reference</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>Env var</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>HERMES_MODEL_ROUTER</code></td><td><code>1</code></td><td>Set to <code>0</code> to disable entirely</td></tr>
+        <tr><td><code>HERMES_ROUTER_SKIP_TYPES</code></td><td><em>empty</em></td><td>Comma-separated turn types to skip routing</td></tr>
+        <tr><td><code>HERMES_ROUTER_TIER0</code></td><td><code>ministral-3:3b</code></td><td>Override tiny model</td></tr>
+        <tr><td><code>HERMES_ROUTER_TIER1</code></td><td><code>gemma3:12b</code></td><td>Override small model</td></tr>
+        <tr><td><code>HERMES_ROUTER_TIER2</code></td><td><code>devstral-small-2:24b</code></td><td>Override medium model</td></tr>
+        <tr><td><code>HERMES_ROUTER_TIER3</code></td><td><code>glm-5.2</code></td><td>Override large model</td></tr>
+        <tr><td><code>HERMES_ROUTER_VISION1/2/3</code></td><td><code>gemma3:4b/12b/27b</code></td><td>Override vision models</td></tr>
+        <tr><td><code>HERMES_ROUTER_CODE1</code></td><td><code>devstral-small-2:24b</code></td><td>Override code-mid model</td></tr>
+        <tr><td><code>HERMES_ROUTER_CODE2</code></td><td><code>qwen3-coder:480b</code></td><td>Override code-heavy model</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<p style="color:var(--muted);font-size:0.75rem;text-align:center;margin-top:40px">
+  Generated from <code>hermes/plugins/model-router/__init__.py</code> + <code>hermes/agent/complexity_matrix.py</code> — 2026-06-30
+</p>
+
+</body>
+</html>

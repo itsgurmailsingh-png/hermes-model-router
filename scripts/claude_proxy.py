@@ -357,23 +357,44 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
         # Score the request
         call_type = _infer_call_type(messages, original_model)
 
+        user_text = _extract_user_text(messages)
+        ctx_floor = _context_floor(user_text)
+        feedback = _feedback_floor(call_type)
+        offset = CALL_TYPE_OFFSET.get(call_type, 0) if USE_HERMES_ROUTER else 0
+
         if USE_HERMES_ROUTER:
-            # Use the Hermes ClaudeRouter
-            user_text = _extract_user_text(messages)
-            raw_score = _score(user_text, [])
-            ctx_floor = _context_floor(user_text)
-            feedback = _feedback_floor(call_type)
-            offset = CALL_TYPE_OFFSET.get(call_type, 0)
-            effective = max(raw_score, ctx_floor, raw_score + feedback)
-            final_score = max(0, min(100, effective + offset))
-            tier = _score_to_tier(final_score)
+            # Try complexity matrix first (4-dimensional)
+            try:
+                from hermes.agent.complexity_matrix import evaluate, select_model as _matrix_select
+                dims = evaluate(
+                    text=user_text,
+                    messages=messages,
+                    history=messages,
+                    ctx_tree_floor=ctx_floor,
+                    feedback_floor=feedback,
+                )
+                raw_score = dims.text
+                combined = dims.combined + offset
+                combined = max(0, min(100, max(combined, ctx_floor)))
+
+                # Vision → Sonnet min; heavy code → Opus; else tier by combined
+                if dims.vision >= 100:
+                    tier = 2 if dims.text <= 50 else 3
+                elif dims.code >= 50:
+                    tier = 3
+                elif dims.code > 25 and dims.code >= dims.text * 0.6:
+                    tier = 2
+                else:
+                    tier = _score_to_tier(int(combined))
+                final_score = int(combined)
+            except Exception:
+                # Fallback to legacy single-score
+                raw_score = _score(user_text, [])
+                effective = max(raw_score, ctx_floor, raw_score + feedback)
+                final_score = max(0, min(100, effective + offset))
+                tier = _score_to_tier(final_score)
         else:
-            # Built-in scoring
-            user_text = _extract_user_text(messages)
             raw_score = _builtin_score(messages)
-            ctx_floor = _context_floor(user_text)
-            feedback = _feedback_floor(call_type)
-            offset = CALL_TYPE_OFFSET.get(call_type, 0) if USE_HERMES_ROUTER else 0
             effective = max(raw_score, ctx_floor, raw_score + feedback)
             final_score = max(0, min(100, effective + offset))
             tier = _score_to_tier(final_score)

@@ -193,13 +193,16 @@ class ClaudeRouter:
         message: str,
         history: Optional[List[dict]] = None,
         call_type: str = "plan",
+        user_message: Any = None,
     ) -> str:
-        """Return the Claude model name for this call."""
-        history = history or []
-        turn_score = _score(message, history)
-        effective = max(turn_score, self._session.complexity_floor)
+        """Return the Claude model name for this call.
 
-        # Boost floor from context tree if available
+        Uses the complexity matrix (4-dimensional scoring) when available,
+        falls back to the legacy single-score algorithm.
+        """
+        history = history or []
+
+        # ── Context tree floor ────────────────────────────────────────────────
         ctx_floor_val = 0
         if self._context_graph is not None and len(self._context_graph) > 0:
             try:
@@ -208,19 +211,87 @@ class ClaudeRouter:
                 except ImportError:
                     from hermes.agent.context_tree import complexity_floor as _ctx_floor
                 ctx_floor_val = _ctx_floor(self._context_graph, message)
-                effective = max(effective, ctx_floor_val)
             except Exception:
                 pass
 
+        # ── Feedback floor ────────────────────────────────────────────────────
+        fb_floor = 0
+        try:
+            fb_floor = self._session.feedback_floor(call_type) if hasattr(self._session, 'feedback_floor') else 0
+        except Exception:
+            pass
+
+        # ── Complexity matrix scoring (preferred) ─────────────────────────────
         offset = CALL_TYPE_OFFSET.get(call_type, 0)
+        try:
+            try:
+                from agent.complexity_matrix import evaluate, select_model as _matrix_select
+            except ImportError:
+                from hermes.agent.complexity_matrix import evaluate, select_model as _matrix_select
+
+            dims = evaluate(
+                text=message,
+                messages=history,
+                history=history,
+                user_message=user_message,
+                ctx_tree_floor=max(ctx_floor_val, self._session.complexity_floor),
+                feedback_floor=fb_floor,
+            )
+
+            # Map matrix dimensions → Claude tier
+            # Combined score is weighted sum; apply offset then floor boosts
+            combined = dims.combined + offset
+            combined = max(0, min(100, combined))
+            combined = max(combined, ctx_floor_val, self._session.complexity_floor)
+
+            # Priority 1 — Vision
+            if dims.vision >= 100:
+                # Haiku has basic vision; Sonnet for anything with real text
+                model = self.tiers.tier2 if dims.text <= 30 else self.tiers.tier3
+            # Priority 2 — Heavy code (multi-file, complex codebase)
+            elif dims.code >= 50:
+                model = self.tiers.tier3
+            elif dims.code > 25 and dims.code >= dims.text * 0.5:
+                model = self.tiers.tier2
+            # Priority 3 — Text complexity (architecture/design prompts with no code)
+            # text >= 55 means 3+ high-signal keywords → needs at least Sonnet
+            elif dims.text >= 55:
+                model = self.tiers.tier2 if dims.text < 75 else self.tiers.tier3
+            # Priority 4 — Context depth (mid-task tool loops)
+            # High context (many tool results in flight) needs Sonnet minimum
+            elif dims.context >= 30:
+                model = self.tiers.tier2
+            # Priority 5 — Standard combined score
+            # Claude-specific thresholds (tighter than Ollama — Haiku is strong)
+            elif combined <= 15:
+                model = self.tiers.tier0   # trivial: "ok", "thanks", "yes"
+            elif combined <= 35:
+                model = self.tiers.tier1   # simple Q&A, short follow-ups
+            elif combined <= 60:
+                model = self.tiers.tier2   # analysis, medium tasks
+            else:
+                model = self.tiers.tier3   # architecture, deep reasoning
+
+            logger.debug(
+                "claude_router[matrix]: call_type=%s text=%d code=%d vision=%d "
+                "ctx=%d combined=%.1f floor=%d ctx_floor=%d → %s",
+                call_type, dims.text, dims.code, dims.vision, dims.context,
+                dims.combined, self._session.complexity_floor, ctx_floor_val, model,
+            )
+            return model
+
+        except Exception as exc:
+            logger.debug("claude_router: matrix unavailable (%s), falling back", exc)
+
+        # ── Fallback: legacy single-score ─────────────────────────────────────
+        turn_score = _score(message, history)
+        effective = max(turn_score, self._session.complexity_floor, ctx_floor_val)
         final = max(0, min(100, effective + offset))
         model = self.tiers.for_score(final)
 
         logger.debug(
-            "claude_router: call_type=%s msg_score=%d floor=%d ctx_floor=%d "
-            "final=%d → %s",
-            call_type, turn_score, self._session.complexity_floor,
-            ctx_floor_val, final, model,
+            "claude_router[legacy]: call_type=%s score=%d floor=%d ctx=%d final=%d → %s",
+            call_type, turn_score, self._session.complexity_floor, ctx_floor_val, final, model,
         )
         return model
 

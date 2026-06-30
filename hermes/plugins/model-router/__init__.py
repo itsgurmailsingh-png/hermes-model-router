@@ -39,6 +39,95 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── Fallback chains ───────────────────────────────────────────────────────────
+# When a model returns 503/529/busy, the router tries the next model in the chain.
+# Each model maps to its fallback in tier order (cheap → expensive direction for
+# busy signals, since busy usually means overloaded at that tier).
+
+_OLLAMA_FALLBACK: dict[str, list[str]] = {
+    # T0 busy → try T1 → T2 → T3
+    "ministral-3:3b":       ["gemma3:12b", "devstral-small-2:24b", "glm-5.2"],
+    # T1 busy → try T0 (different load) or T2
+    "gemma3:12b":           ["ministral-3:3b", "devstral-small-2:24b", "glm-5.2"],
+    # T2 busy → try T1 → T3
+    "devstral-small-2:24b": ["gemma3:12b", "glm-5.2", "ministral-3:3b"],
+    # T3 busy → try T2 → T1
+    "glm-5.2":              ["devstral-small-2:24b", "gemma3:12b", "ministral-3:3b"],
+    # Vision models
+    "gemma3:4b":            ["gemma3:12b", "gemma3:27b"],
+    "gemma3:27b":           ["gemma3:12b", "devstral-small-2:24b"],
+    # Code specialist
+    "qwen3-coder:480b":     ["devstral-small-2:24b", "glm-5.2"],
+    # Ultra
+    "deepseek-v3.1:671b":   ["glm-5.2", "devstral-small-2:24b"],
+    "mistral-large-3:675b": ["glm-5.2", "devstral-small-2:24b"],
+}
+
+_CLAUDE_FALLBACK: dict[str, list[str]] = {
+    "claude-haiku-4-5-20251001": ["claude-sonnet-4-6"],
+    "claude-sonnet-4-6":         ["claude-haiku-4-5-20251001", "claude-opus-4-6"],
+    "claude-opus-4-6":           ["claude-sonnet-4-6"],
+}
+
+# Error status codes / message fragments that mean "model busy, try another"
+_BUSY_STATUS_CODES = frozenset({429, 503, 529, 502, 504})
+_BUSY_FRAGMENTS = (
+    "busy", "overloaded", "unavailable", "rate limit", "rate_limit",
+    "too many requests", "model_overloaded", "capacity", "no instances",
+    "service unavailable", "gateway timeout", "bad gateway",
+)
+
+# Per-session busy model tracking: {session_id: {model: expiry_timestamp}}
+_busy_models: dict[str, dict[str, float]] = {}
+_BUSY_TTL = 120.0  # seconds to treat a model as busy
+
+# Persisted busy state file — survives across turns and sessions
+_BUSY_STATE_FILE = Path.home() / ".hermes" / "router-logs" / "busy-models.json"
+
+
+def _load_busy_state() -> None:
+    """Load persisted busy state from disk on startup."""
+    import time
+    try:
+        if _BUSY_STATE_FILE.exists():
+            data = json.loads(_BUSY_STATE_FILE.read_text())
+            now = time.monotonic()
+            # data format: {model: absolute_expiry_epoch}
+            # Convert epoch → monotonic by offset
+            epoch_now = __import__("time").time()
+            mono_offset = now - epoch_now
+            for model, epoch_expiry in data.items():
+                mono_expiry = epoch_expiry + mono_offset
+                if mono_expiry > now:  # still busy
+                    _busy_models.setdefault("_global", {})[model] = mono_expiry
+    except Exception:
+        pass
+
+
+def _save_busy_state() -> None:
+    """Persist busy state to disk so it survives across turns."""
+    import time
+    try:
+        _BUSY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        mono_offset = now_epoch - now_mono
+        out = {}
+        for session_state in _busy_models.values():
+            for model, mono_expiry in session_state.items():
+                if mono_expiry > now_mono:
+                    epoch_expiry = mono_expiry + mono_offset
+                    # Keep the longest remaining expiry per model
+                    if model not in out or out[model] < epoch_expiry:
+                        out[model] = epoch_expiry
+        _BUSY_STATE_FILE.write_text(json.dumps(out))
+    except Exception:
+        pass
+
+
+# Load on import
+_load_busy_state()
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 _LOG_DIR  = Path.home() / ".hermes" / "router-logs"
@@ -246,39 +335,29 @@ def on_pre_llm_call(
                 call_type=call_type,
             )
         else:
-            # Use the session's RouterSession directly — no FakeAgent needed.
-            # We create a minimal agent-like object that carries the session
-            # state and context graph, both pulled from the plugin's session dict.
+            # ── Complexity matrix routing ─────────────────────────────────────
+            # Multi-dimensional scoring: text, code, vision, context
+            try:
+                try:
+                    from agent.complexity_matrix import route as matrix_route
+                except ImportError:
+                    from hermes.agent.complexity_matrix import route as matrix_route
+            except Exception:
+                # Fallback to old single-score router
+                matrix_route = None
+
             session_obj = _get_session(session_id) if session_id else RouterSession()
-            # Load persisted feedback into the session on first use
             if not session_obj.feedback and session_obj.turns == 0:
                 try:
                     session_obj.feedback = load_feedback()
                 except Exception:
                     pass
 
-            class _RouterAgent:
-                """Minimal agent carrying session + graph for route_call()."""
-                def __init__(self, sess, graph):
-                    self._router_session = sess
-                    self._context_graph = graph
-
             graph = _get_ctx_graph(session_id) if session_id else None
             if graph is None and agent is not None:
                 graph = getattr(agent, "_context_graph", None)
-            ra = _RouterAgent(session_obj, graph)
 
-            # Compute score for logging
-            try:
-                try:
-                    from agent.model_router import _score_message
-                except ImportError:
-                    from hermes.agent.model_router import _score_message
-                _raw_score = _score_message(str(user_message or ""), list(conversation_history or []))
-            except Exception:
-                _raw_score = None
-
-            # Context tree floor for logging
+            # Context tree floor
             _ctx_floor_val = 0
             if graph is not None and len(graph) > 0:
                 try:
@@ -290,55 +369,80 @@ def on_pre_llm_call(
                 except Exception:
                     pass
 
-            # Feedback floor for logging
+            # Feedback floor
             _fb_floor = session_obj.feedback_floor(call_type) if session_obj else 0
 
-            # Image detection: check if any message has an image attachment
-            _has_image = False
-            if isinstance(user_message, dict) and user_message.get("attachments"):
-                _has_image = any(att.get("type") == "image" for att in user_message["attachments"])
-            elif conversation_history:
-                for msg in conversation_history:
-                    if isinstance(msg, dict) and msg.get("attachments"):
-                        _has_image = any(att.get("type") == "image" for att in msg["attachments"])
-                        break
-
-            routed = route_call(
-                ra,
-                CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE,
-                str(user_message or ""),
-                list(conversation_history or []),
-                tiers,
-            )
-
-            # Compute final score for logging
-            _final = None
-            if _raw_score is not None:
-                _effective = max(_raw_score, session_obj.complexity_floor if session_obj else 0)
-                _effective = max(_effective, _ctx_floor_val)
-                if _fb_floor > 0:
-                    _effective = max(_effective, _raw_score + _fb_floor)
+            # Call-type offset
+            try:
                 try:
-                    from agent.model_router import CALL_TYPE_OFFSET as _CTO
+                    from agent.model_router import CALL_TYPE_OFFSET as _CTO, CallType
                 except ImportError:
-                    from hermes.agent.model_router import CALL_TYPE_OFFSET as _CTO
-                _offset = _CTO.get(CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE, 0)
-                _final = max(0, min(100, _effective + _offset))
+                    from hermes.agent.model_router import CALL_TYPE_OFFSET as _CTO, CallType
+                ct_enum = CallType(call_type) if call_type in [c.value for c in CallType] else CallType.ANALYZE
+                _offset = _CTO.get(ct_enum, 0)
+            except Exception:
+                _offset = 0
+                ct_enum = None
 
-            # Image routing: if there's an image, force tier 3 (vision model)
-            # or tier 2 if no vision model is available
-            if _has_image:
-                # Try to find a vision model in the tiers
-                vision_model = None
-                for tier in [tiers.tier3, tiers.tier2, tiers.tier1, tiers.tier0]:
-                    if tier and any(x in tier.lower() for x in ['llava', 'bakllava', 'multimodal', 'vision']):
-                        vision_model = tier
-                        break
-                if vision_model:
-                    routed = vision_model
-                else:
-                    # No vision model — use tier 3 (highest available)
-                    routed = tiers.tier3
+            if matrix_route is not None:
+                # Use complexity matrix
+                routed, dims = matrix_route(
+                    text=str(user_message or ""),
+                    messages=list(conversation_history or []),
+                    history=list(conversation_history or []),
+                    user_message=user_message,
+                    ctx_tree_floor=_ctx_floor_val,
+                    feedback_floor=_fb_floor,
+                    call_type_offset=_offset,
+                )
+                _raw_score = dims.text
+                _final = int(dims.combined + _offset)
+                _has_image = dims.vision > 0
+            else:
+                # Fallback: old single-score router
+                class _RouterAgent:
+                    def __init__(self, sess, graph):
+                        self._router_session = sess
+                        self._context_graph = graph
+                ra = _RouterAgent(session_obj, graph)
+                routed = route_call(
+                    ra,
+                    ct_enum or CallType.ANALYZE,
+                    str(user_message or ""),
+                    list(conversation_history or []),
+                    tiers,
+                )
+                try:
+                    try:
+                        from agent.model_router import _score_message
+                    except ImportError:
+                        from hermes.agent.model_router import _score_message
+                    _raw_score = _score_message(str(user_message or ""), list(conversation_history or []))
+                except Exception:
+                    _raw_score = None
+                _final = None
+                _has_image = False
+                if _raw_score is not None:
+                    _effective = max(_raw_score, session_obj.complexity_floor if session_obj else 0)
+                    _effective = max(_effective, _ctx_floor_val)
+                    if _fb_floor > 0:
+                        _effective = max(_effective, _raw_score + _fb_floor)
+                    _final = max(0, min(100, _effective + _offset))
+
+        # ── Busy-model check: skip routed model if it's marked busy ──────────
+        if routed and session_id and _is_model_busy(session_id, routed):
+            fallback = _fallback_for(routed, session_id)
+            if fallback:
+                logger.warning(
+                    "model-router: %s is busy, using fallback %s", routed, fallback
+                )
+                routed = fallback
+            else:
+                logger.warning(
+                    "model-router: %s is busy and no fallback available, using original %s",
+                    routed, model,
+                )
+                routed = model  # give up and use whatever the user had
 
         changed = routed and routed != model
         _log_decision({
@@ -447,6 +551,43 @@ def on_turn_start(
         pass
 
 
+def on_llm_error(
+    *,
+    session_id: str = "",
+    model: str = "",
+    error: Any = None,
+    turn_type: str = "user",
+    **_: Any,
+) -> Optional[dict]:
+    """Called when an LLM API call fails.
+
+    If the error is a busy/rate-limit signal, marks the model as busy and
+    returns a fallback model for Hermes to retry with immediately.
+    Returns {"model": <fallback>} to retry, or None to let Hermes handle it.
+    """
+    if not error:
+        return None
+    if not _is_busy_error(error):
+        return None  # not a busy error — don't interfere
+
+    current_model = model or ""
+    if session_id:
+        _mark_busy(session_id, current_model)
+
+    fallback = _fallback_for(current_model, session_id or "")
+    if fallback:
+        logger.warning(
+            "model-router: %s busy (%s) → retrying with %s",
+            current_model, type(error).__name__, fallback,
+        )
+        return {"model": fallback, "retry": True}
+
+    logger.warning(
+        "model-router: %s busy and no fallback available — giving up", current_model
+    )
+    return None
+
+
 def on_turn_end(
     *,
     session_id: str = "",
@@ -466,6 +607,64 @@ def on_turn_end(
         pass
 
 
+def _is_busy_error(exc: Exception) -> bool:
+    """Return True if the exception looks like a model-busy / rate-limit error."""
+    import time
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if status in _BUSY_STATUS_CODES:
+        return True
+    msg = str(exc).lower()
+    return any(frag in msg for frag in _BUSY_FRAGMENTS)
+
+
+def _mark_busy(session_id: str, model: str) -> None:
+    """Mark a model as busy globally + per-session for _BUSY_TTL seconds."""
+    import time
+    expiry = time.monotonic() + _BUSY_TTL
+    for key in (session_id, "_global"):
+        if key:
+            _busy_models.setdefault(key, {})[model] = expiry
+    _save_busy_state()
+    logger.warning("model-router: marked %s busy for %.0fs", model, _BUSY_TTL)
+    _log_decision({
+        "ts":         datetime.now(timezone.utc).isoformat(),
+        "source":     "hermes",
+        "event":      "busy",
+        "session_id": session_id,
+        "model":      model,
+        "ttl":        _BUSY_TTL,
+    })
+
+
+def _is_model_busy(session_id: str, model: str) -> bool:
+    """Return True if model is still in the busy window (session or global)."""
+    import time
+    now = time.monotonic()
+    for key in (session_id, "_global"):
+        if not key:
+            continue
+        expiry = _busy_models.get(key, {}).get(model)
+        if expiry is None:
+            continue
+        if now < expiry:
+            return True
+        # Expired — clean up
+        _busy_models.get(key, {}).pop(model, None)
+    return False
+
+
+def _fallback_for(model: str, session_id: str) -> Optional[str]:
+    """Return the first non-busy fallback for model, or None if all busy."""
+    chain = _OLLAMA_FALLBACK.get(model) or _CLAUDE_FALLBACK.get(model) or []
+    # Also check env var overrides (user may have customised tier models)
+    for candidate in chain:
+        if not _is_model_busy(session_id, candidate):
+            return candidate
+    return None
+
+
 def _is_claude(model: str, provider: str) -> bool:
     m = (model or "").lower()
     p = (provider or "").lower()
@@ -478,7 +677,8 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
+    ctx.register_hook("on_llm_error", on_llm_error)
     ctx.register_hook("on_tool_result", on_tool_result)
     ctx.register_hook("on_turn_start", on_turn_start)
     ctx.register_hook("on_turn_end", on_turn_end)
-    logger.info("model-router plugin v1.1 loaded — all calls routed, context tree active")
+    logger.info("model-router plugin v1.2 loaded — routing + fallback + context tree active")
